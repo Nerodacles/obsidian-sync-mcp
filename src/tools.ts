@@ -39,6 +39,46 @@ const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as c
 // context budget. Other clients ignore the key.
 export const READ_NOTE_MAX_RESULT_SIZE_CHARS = 100_000;
 
+/** An edit that can't be applied to the note's current text. */
+class EditRefused extends Error {}
+
+export type WriteMode = "upsert" | "create" | "update";
+
+/**
+ * The write mode WRITE_FOLDERS allows for a whole-note write at `path`, or the
+ * refusal to show. Whether it creates or updates depends on the note existing,
+ * so the backend decides in the same step as the write.
+ */
+export function chooseWriteMode(path: string, writeFolders: WriteScope): { mode: WriteMode } | { denied: string } {
+    const allow = allowedActions(path, writeFolders);
+    const canCreate = allow.has("create");
+    const canUpdate = allow.has("update");
+    if (!canCreate && !canUpdate) return { denied: checkWrite(path, "create", writeFolders)! };
+    return { mode: canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update" };
+}
+
+/**
+ * Read a note, change its text with `apply`, and write it back without
+ * recreating a note deleted in between. Returns the new text, or null when the
+ * note doesn't exist. The caller checks WRITE_FOLDERS ("update") first. Shared
+ * by edit_note and plugins, so both get the same write semantics.
+ */
+export async function editNoteText(vault: VaultBackend, path: string, apply: (content: string) => string): Promise<string | null> {
+    const existing = await vault.readNote(path);
+    if (existing === null) return null;
+    const updated = apply(existing);
+    let ok: boolean;
+    try {
+        // "update": a note deleted since it was read isn't recreated.
+        ok = await vault.writeNote(path, updated, { mode: "update" });
+    } catch (err) {
+        if (err instanceof NoteNotFoundError) return null;
+        throw err;
+    }
+    if (!ok) throw new Error(`Failed to edit note: ${path}`);
+    return updated;
+}
+
 export function registerTools(
     server: FastMCP,
     vault: VaultBackend,
@@ -93,14 +133,9 @@ export function registerTools(
             content: z.string().describe("Full markdown content for the note"),
         }),
         execute: async ({ path, content }) => {
-            // Whether this is a create or an update depends on the note existing,
-            // so pass what's allowed down and let the backend decide in the same
-            // step as the write.
-            const allow = allowedActions(path, writeFolders);
-            const canCreate = allow.has("create");
-            const canUpdate = allow.has("update");
-            if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders)!;
-            const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
+            const choice = chooseWriteMode(path, writeFolders);
+            if ("denied" in choice) return choice.denied;
+            const { mode } = choice;
             let ok: boolean;
             try {
                 ok = await vault.writeNote(path, content, { mode });
@@ -342,50 +377,38 @@ export function registerTools(
         execute: async ({ path, content: newContent, operation, old_text }) => {
             const denied = checkWrite(path, "update", writeFolders);
             if (denied) return denied;
-            const existing = await vault.readNote(path);
-            if (existing === null) {
-                return `Note not found: ${path}`;
-            }
-
-            let updated: string;
             const op = operation ?? "append";
-
-            if (op === "replace") {
-                if (!old_text) {
-                    return "old_text is required for replace operation.";
-                }
-                const idx = existing.indexOf(old_text);
-                if (idx === -1) {
-                    return "old_text not found in note.";
-                }
-                if (existing.indexOf(old_text, idx + 1) !== -1) {
-                    return "old_text matches multiple times. Provide a longer, unique string.";
-                }
-                updated = existing.slice(0, idx) + newContent + existing.slice(idx + old_text.length);
-            } else if (op === "prepend") {
-                // Insert after frontmatter if present
-                const fmMatch = existing.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/);
-                if (fmMatch) {
-                    const afterFm = fmMatch[0].length;
-                    updated = existing.slice(0, afterFm) + newContent + "\n" + existing.slice(afterFm);
-                } else {
-                    updated = newContent + "\n" + existing;
-                }
-            } else {
-                // append
-                updated = existing.endsWith("\n") ? existing + newContent : existing + "\n" + newContent;
-            }
-
-            let ok: boolean;
+            let updated: string | null;
             try {
-                // "update": a note deleted since it was read isn't recreated.
-                ok = await vault.writeNote(path, updated, { mode: "update" });
+                updated = await editNoteText(vault, path, (existing) => {
+                    if (op === "replace") {
+                        if (!old_text) throw new EditRefused("old_text is required for replace operation.");
+                        const idx = existing.indexOf(old_text);
+                        if (idx === -1) throw new EditRefused("old_text not found in note.");
+                        if (existing.indexOf(old_text, idx + 1) !== -1) {
+                            throw new EditRefused("old_text matches multiple times. Provide a longer, unique string.");
+                        }
+                        return existing.slice(0, idx) + newContent + existing.slice(idx + old_text.length);
+                    }
+                    if (op === "prepend") {
+                        // Insert after frontmatter if present
+                        const fmMatch = existing.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/);
+                        if (fmMatch) {
+                            const afterFm = fmMatch[0].length;
+                            return existing.slice(0, afterFm) + newContent + "\n" + existing.slice(afterFm);
+                        }
+                        return newContent + "\n" + existing;
+                    }
+                    // append
+                    return existing.endsWith("\n") ? existing + newContent : existing + "\n" + newContent;
+                });
             } catch (err) {
-                if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
+                if (err instanceof EditRefused) return err.message;
+                if (err instanceof Error && err.message === `Failed to edit note: ${path}`) return err.message;
                 throw err;
             }
-            if (!ok) {
-                return `Failed to edit note: ${path}`;
+            if (updated === null) {
+                return `Note not found: ${path}`;
             }
             searchIndex.update(path, updated, Date.now());
             const deepLink = makeDeepLink(vaultName, path);

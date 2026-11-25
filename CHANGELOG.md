@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **Plugins (`PLUGIN_DIR`, opt-in).** Add your own tools without forking: each `.js`/`.mjs` file in the directory registers tools at startup through a small context whose vault calls apply the same `READ_ONLY` and `WRITE_FOLDERS` checks as the built-in tools. A plugin that fails to load, or reuses a tool name, stops startup with a message naming the file.
+
 ## 0.13.0
 
 ### Features
