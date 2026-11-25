@@ -5,9 +5,13 @@
 ### Features
 - **Plugins (`PLUGIN_DIR`, opt-in).** Add your own tools without forking: each `.js`/`.mjs` file in the directory registers tools at startup through a small context whose vault calls apply the same `READ_ONLY` and `WRITE_FOLDERS` checks as the built-in tools. A plugin that fails to load, or reuses a tool name, stops startup with a message naming the file.
 - **`write_note` takes `create_only`.** With `create_only: true` the write only creates: if a note already exists at the path, nothing is written and the answer says so. Useful for agents that pick a file name and must not clobber someone else's note.
+- **`op_id` makes retried writes safe (opt-in, CouchDB mode).** Set `OPS_DATABASE` to a database name and the write tools accept an `op_id`: a call repeated with the same id (an agent retrying after a timeout) returns the first answer instead of appending or writing again. Records live in that separate database, so they work across server instances and restarts and are never synced to Obsidian. Without `OPS_DATABASE` nothing changes and `op_id` is refused.
 
 ### Fixes
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
+
+### Tests
+- `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 
 ## 0.14.0
 

@@ -18,6 +18,7 @@ import { redactCredentials, describeError, describeLogMessage } from "./redact.j
 import { parsePathNormalization, type PathNormalizationSetting } from "./path-identity-config.js";
 import { declareUtf8Charset } from "./http-charset.js";
 import { loadPlugins, trackToolNames } from "./plugins.js";
+import { CouchOpStore } from "./op-store.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -50,6 +51,8 @@ const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const READ_ONLY = process.env.READ_ONLY === "true";
 // Extra tools from this directory (see plugins.ts); off unless set.
 const PLUGIN_DIR = process.env.PLUGIN_DIR?.trim() || undefined;
+// Idempotency records for op_id (see op-store.ts); off unless set.
+const OPS_DATABASE = process.env.OPS_DATABASE?.trim() || undefined;
 let WRITE_FOLDERS: WriteScope;
 try {
     WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
@@ -486,8 +489,29 @@ if (AUTH_TOKEN) {
     await auth.loadTokens();
 }
 
+// --- Idempotency records ---
+let opStore: CouchOpStore | undefined;
+if (OPS_DATABASE && !READ_ONLY) {
+    if (!COUCHDB_URL || VAULT_PATH) {
+        console.error("OPS_DATABASE needs CouchDB mode (COUCHDB_URL).");
+        process.exit(1);
+    }
+    if (OPS_DATABASE === COUCHDB_DATABASE) {
+        console.error("OPS_DATABASE must not be the vault database: LiveSync would replicate the records to every device.");
+        process.exit(1);
+    }
+    opStore = new CouchOpStore(COUCHDB_URL, OPS_DATABASE, COUCHDB_USER, COUCHDB_PASSWORD!);
+    try {
+        const state = await opStore.ensureDatabase();
+        console.log(`op_id enabled: operation records in database ${OPS_DATABASE}${state === "created" ? " (created)" : ""}.`);
+    } catch (err) {
+        console.error(describeError(err, debugLogging));
+        process.exit(1);
+    }
+}
+
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined);
+registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined, opStore);
 
 if (ATTACHMENTS_ENABLED) {
     const uploadRegistry = new UploadRegistry({ ttlMs: ATTACHMENT_UPLOAD_TTL_SECONDS * 1000 });

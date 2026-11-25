@@ -6,6 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
+import { fingerprint, OP_ID_PATTERN, type OpStore } from "./op-store.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -131,6 +132,33 @@ const expectedRevisionParam = z
     .optional()
     .describe("Optional, CouchDB mode: the revision from read_note or get_note_metadata. The write only happens if the note is still at that revision; otherwise nothing is written and the current revision is returned.");
 
+export const NO_OP_STORE_MESSAGE = "op_id needs OPS_DATABASE (CouchDB mode): this server keeps no operation records. Nothing was written.";
+
+const opIdParam = z
+    .string()
+    .regex(OP_ID_PATTERN, "op_id: 1-128 characters from A-Z a-z 0-9 . _ : -")
+    .optional()
+    .describe("Optional idempotency key, unique per intended change (e.g. a UUID). A retry with the same op_id returns the first call's answer instead of writing again.");
+
+/**
+ * Run a write tool at most once per op_id: the first call claims the id and
+ * stores its answer; a repeat gets that answer back without running.
+ */
+async function runOnce(opStore: OpStore, tool: string, args: Record<string, unknown>, run: () => Promise<unknown>): Promise<unknown> {
+    const opId = args.op_id as string;
+    const claim = await opStore.claim(opId, fingerprint(tool, args));
+    if (claim.state === "done") return claim.result;
+    if (claim.state === "mismatch") return `op_id ${opId} was already used for a different call (another tool or other arguments). Nothing was written; use a new op_id.`;
+    if (claim.state === "pending") {
+        return `op_id ${opId} was claimed at ${new Date(claim.startedAt).toISOString()} and has not finished: it is still running, or it was interrupted and its outcome is unknown. ` +
+            "Nothing was done by this call. Read the note to see whether the change is there before retrying with a new op_id.";
+    }
+    // If the call throws, the record stays pending: the write may or may not have happened.
+    const result = await run();
+    await opStore.complete(opId, claim.token, typeof result === "string" ? result : JSON.stringify(result));
+    return result;
+}
+
 // Claude Code persists any MCP tool result above ~50 000 characters to a file
 // and hands the model a 2 kB preview instead of the text. A tool can raise its
 // own threshold (hard ceiling 500 000) by declaring
@@ -150,6 +178,7 @@ export function registerTools(
     readOnly = false,
     writeFolders: WriteScope = null,
     syncBeforeSearch?: SyncBeforeSearch,
+    opStore?: OpStore,
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
@@ -159,6 +188,16 @@ export function registerTools(
     const writeScopeNote = describeWriteScope(writeFolders);
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
+        if (!readOnly && (WRITE_TOOLS as readonly string[]).includes(tool.name)) {
+            tool.parameters = tool.parameters.extend({ op_id: opIdParam });
+            const write = tool.execute;
+            tool.execute = async (args: any, ctx: any) => {
+                if (args.op_id === undefined) return write(args, ctx);
+                if (!opStore) return NO_OP_STORE_MESSAGE;
+                const { op_id: _opId, ...rest } = args;
+                return runOnce(opStore, tool.name, args, () => write(rest, ctx));
+            };
+        }
         const original = tool.execute;
         tool.execute = async (args: any, ctx: any) => {
             if (debugLogging) console.log(`[tool] ${tool.name}(${JSON.stringify(args)})`);
