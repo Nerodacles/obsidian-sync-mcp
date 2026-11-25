@@ -161,3 +161,23 @@ describe("plugins", () => {
         assert.ok(tools.some((t) => t.name === "add_task"));
     });
 });
+
+describe("plugins on a backend with revisions", () => {
+    it("editNote goes through the revision-checked update, like edit_note", async () => {
+        const { guardedVault } = await import("./plugins.js");
+        const calls: string[] = [];
+        let text = "start";
+        const backend: any = {
+            readNote: async () => text,
+            writeNote: async () => { calls.push("writeNote"); return true; },
+            updateNote: async (_p: string, apply: (c: string) => string, o: any) => {
+                calls.push(`updateNote maxAttempts=${o?.maxAttempts}`);
+                text = apply(text);
+                return { content: text, revision: "2-x", attempts: 1 };
+            },
+        };
+        const v = guardedVault(backend, new SearchIndex(), null, false);
+        assert.equal(await v.editNote("a.md", (t) => t + "!"), "start!");
+        assert.deepEqual(calls, ["updateNote maxAttempts=10"]);
+    });
+});
