@@ -138,6 +138,7 @@ describe("plugins", () => {
         await load();
         assert.deepEqual(JSON.parse(await call("inspect_context", {})), {
             ctx: ["addTool", "log", "readOnly", "vault", "vaultName", "z"],
+            // Local mode has no revisions, so no readNoteRevision.
             vault: ["deleteNote", "editNote", "getMetadata", "listNotes", "moveNote", "readNote", "writeNote"],
         });
     });
@@ -179,5 +180,34 @@ describe("plugins on a backend with revisions", () => {
         const v = guardedVault(backend, new SearchIndex(), null, false);
         assert.equal(await v.editNote("a.md", (t) => t + "!"), "start!");
         assert.deepEqual(calls, ["updateNote maxAttempts=10"]);
+    });
+});
+
+describe("plugins: revision checks like write_note's expected_revision", () => {
+    it("readNoteRevision is passed through, and a stale expectedRevision writes nothing", async () => {
+        const { guardedVault } = await import("./plugins.js");
+        const { RevisionMismatchError } = await import("./vault-backend.js");
+        let text = "v1";
+        let rev = 1;
+        const backend: any = {
+            readNote: async () => text,
+            readNoteRevision: async () => ({ content: text, revision: `${rev}-x` }),
+            updateNote: async (_p: string, apply: (c: string) => string, o: any) => {
+                if (o?.expectedRevision && o.expectedRevision !== `${rev}-x`) throw new RevisionMismatchError("a.md", o.expectedRevision, `${rev}-x`);
+                text = apply(text); rev++;
+                return { content: text, revision: `${rev}-x`, attempts: 1 };
+            },
+        };
+        const v = guardedVault(backend, new SearchIndex(), parseWriteFolders("Notes"), false);
+        assert.deepEqual(await v.readNoteRevision!("Notes/a.md"), { content: "v1", revision: "1-x" });
+        await v.writeNote("Notes/a.md", "v2", { expectedRevision: "1-x" });
+        assert.equal(text, "v2");
+        await assert.rejects(v.writeNote("Notes/a.md", "v3", { expectedRevision: "1-x" }), /is at revision 2-x, not 1-x/);
+        await assert.rejects(v.writeNote("Other/a.md", "v3", { expectedRevision: "2-x" }), /Write access denied/);
+        assert.equal(text, "v2");
+        // Local mode: refused, not ignored.
+        const local = guardedVault({ readNote: async () => "x", writeNote: async () => true } as any, new SearchIndex(), null, false);
+        assert.equal(local.readNoteRevision, undefined);
+        await assert.rejects(local.writeNote("a.md", "y", { expectedRevision: "1-x" }), /needs CouchDB mode/);
     });
 });
