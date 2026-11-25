@@ -10,6 +10,7 @@
 - **`search_notes` matches words, not substrings.** A term with several words matches a note that contains all of them in any order (`garden plan` finds "the plan for the garden"), words match whole (`ups` no longer finds "backups"), and a hyphen and a space between words are the same (`site-loss` == `site loss`). See [search matching](README.md#search-matching).
 - Frontmatter `aliases` and the `summary` and `case` properties are searched together with the path and title, so their hits rank above plain text hits.
 - `SEARCH_DEFAULT_EXCLUDE` (comma-separated folders) leaves those folders out of `search_notes` unless `folder` points inside one. The status line says which folders were left out and how many matching notes they held. Unset keeps today's behaviour.
+- `read_note` on a path that doesn't exist still answers `Note not found: <path>`, and now adds the notes whose file name or frontmatter `aliases` match the requested name, e.g. `Did you mean:` / `- Projects/Garden plan.md (alias "Veg patch")`.
 
 ### Fixes
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
@@ -22,7 +23,7 @@
 - `search_notes` no longer matches part of a word: `backup` does not find "backups", and `drag kanban` finds notes with both words anywhere, not only the phrase. A term made only of hyphens and spaces (`---`) matches nothing. A query with more than 100 distinct words is refused.
 
 ### Performance
-- The first start after upgrading parses every note once, to index aliases and the summary and case properties.
+- The first start after upgrading parses every note once, to index aliases and the summary and case properties (also used by the `read_note` suggestions).
 
 ## 0.13.0
 

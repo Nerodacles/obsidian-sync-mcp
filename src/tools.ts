@@ -210,7 +210,8 @@ export function registerTools(
     server.addTool({
         name: "read_note",
         description:
-            "Read the content of a note from the Obsidian vault. Returns the markdown content and a deep link to open it in Obsidian; in CouchDB mode also the note's revision, which write_note and edit_note accept as expected_revision.",
+            "Read the content of a note from the Obsidian vault. Returns the markdown content and a deep link to open it in Obsidian; in CouchDB mode also the note's revision, which write_note and edit_note accept as expected_revision. " +
+            "For a path that doesn't exist, it says so and lists notes with that file name or alias elsewhere, if any.",
         _meta: { "anthropic/maxResultSizeChars": READ_NOTE_MAX_RESULT_SIZE_CHARS },
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
@@ -220,7 +221,10 @@ export function registerTools(
             const revised = vault.readNoteRevision ? await vault.readNoteRevision(path) : null;
             const content = revised ? revised.content : await vault.readNote(path);
             if (content === null) {
-                return `Note not found: ${path}`;
+                const suggestions = searchIndex.suggestByName(path);
+                if (suggestions.length === 0) return `Note not found: ${path}`;
+                const lines = suggestions.map((s) => `- ${s.path} (${s.alias !== undefined ? `alias "${s.alias}"` : "same file name"})`);
+                return [`Note not found: ${path}`, "Did you mean:", ...lines].join("\n");
             }
             const deepLink = makeDeepLink(vaultName, path);
             const revisionLine = revised ? `\nRevision: ${revised.revision}` : "";

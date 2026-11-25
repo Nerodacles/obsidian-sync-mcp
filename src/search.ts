@@ -457,6 +457,30 @@ export class SearchIndex {
         return this.aliases.get(path) ?? [];
     }
 
+    /**
+     * Notes whose file name (without .md) or one of whose aliases equals the
+     * file name of `path`, for a read of a path that doesn't exist. Compared
+     * case-insensitively, with hyphens, underscores and runs of spaces taken
+     * as one space. `path` itself is left out; at most `limit`, sorted by path.
+     */
+    suggestByName(path: string, limit = 5): Array<{ path: string; alias?: string }> {
+        const norm = (s: string) => s.normalize("NFC").toLowerCase().replace(/[\s_-]+/g, " ").trim();
+        const base = (p: string) => p.slice(p.lastIndexOf("/") + 1).replace(/\.md$/i, "");
+        const wanted = norm(base(path));
+        if (!wanted) return [];
+        const found: Array<{ path: string; alias?: string }> = [];
+        for (const p of this.listPaths()) {
+            if (p === path) continue;
+            if (norm(base(p)) === wanted) {
+                found.push({ path: p });
+                continue;
+            }
+            const alias = this.getAliases(p).find((a) => norm(a) === wanted);
+            if (alias !== undefined) found.push({ path: p, alias });
+        }
+        return found.slice(0, limit);
+    }
+
     /** Get outgoing links for a path. */
     getLinks(path: string): string[] {
         return this.links.get(path) ?? [];
