@@ -1,0 +1,203 @@
+/**
+ * Plugins: extra tools loaded at startup from PLUGIN_DIR (off unless set).
+ *
+ * Every `.js` / `.mjs` file directly in the directory is imported, in name
+ * order, and its default export is called once with a PluginContext. A plugin
+ * adds tools with `ctx.addTool` (same shape as a built-in FastMCP tool) and
+ * reaches the vault only through `ctx.vault`, which applies the same checks as
+ * the built-in tools: READ_ONLY, WRITE_FOLDERS with its create / update /
+ * delete permissions, and the same write calls (so a plugin's writes get the
+ * same create-only and edit semantics as write_note and edit_note), and keeps
+ * the search index current.
+ *
+ * Trust: a plugin runs in this process with this process's rights. The
+ * context gives it no way around the checks above, but nothing stops a
+ * plugin's own code from importing anything it likes; install only plugins
+ * you would run as the server itself. Startup fails on a plugin that does not
+ * load, does not export a function, throws, or adds a tool whose name is
+ * taken, so a broken plugin is never half-loaded.
+ */
+import { readdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { z } from "zod";
+import { NoteExistsError, NoteNotFoundError, type NoteInfo, type VaultBackend } from "./vault-backend.js";
+import type { SearchIndex } from "./search.js";
+import { checkWrite, type WriteScope } from "./write-scope.js";
+import { chooseWriteMode, editNoteText } from "./tools.js";
+import { READ_ONLY_MESSAGE } from "./vault-readonly.js";
+
+/** A write a plugin asked for was refused; the message is meant for the agent. */
+export class PluginWriteError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "PluginWriteError";
+    }
+}
+
+export interface PluginVault {
+    readNote(path: string): Promise<string | null>;
+    getMetadata(path: string): Promise<NoteInfo | null>;
+    listNotes(folder?: string): Promise<string[]>;
+    /** Create or replace a note, as write_note does; `createOnly` never replaces. */
+    writeNote(path: string, content: string, options?: { createOnly?: boolean }): Promise<void>;
+    /** Change a note's text as edit_note does; returns the new text. */
+    editNote(path: string, apply: (content: string) => string): Promise<string>;
+    deleteNote(path: string): Promise<void>;
+    /** Never replaces a note at `to`. */
+    moveNote(from: string, to: string): Promise<void>;
+}
+
+export interface PluginTool {
+    name: string;
+    description: string;
+    parameters: z.ZodType;
+    execute: (args: any, ctx: any) => Promise<unknown>;
+}
+
+export interface PluginContext {
+    vaultName: string;
+    readOnly: boolean;
+    /** The zod the server uses, for tool parameters. */
+    z: typeof z;
+    vault: PluginVault;
+    addTool(tool: PluginTool): void;
+    log(message: string): void;
+}
+
+export type Plugin = (ctx: PluginContext) => void | Promise<void>;
+
+const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+
+interface ToolServer {
+    addTool(tool: any): void;
+}
+
+/** Record every tool name registered from now on, so plugins can't shadow one. */
+export function trackToolNames(server: ToolServer): Set<string> {
+    const names = new Set<string>();
+    const add = server.addTool.bind(server);
+    server.addTool = (tool: any) => {
+        names.add(tool.name);
+        return add(tool);
+    };
+    return names;
+}
+
+/** The vault as a plugin sees it: every write passes the same checks as the built-in tools. */
+export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writeFolders: WriteScope, readOnly: boolean): PluginVault {
+    const deny = (message: string | null) => {
+        if (message) throw new PluginWriteError(message);
+    };
+    const writable = () => deny(readOnly ? READ_ONLY_MESSAGE : null);
+    return {
+        readNote: (path) => vault.readNote(path),
+        getMetadata: (path) => vault.getMetadata(path),
+        listNotes: (folder) => vault.listNotes(folder),
+        async writeNote(path, content, { createOnly = false } = {}) {
+            writable();
+            const choice = createOnly ? { mode: "create" as const } : chooseWriteMode(path, writeFolders);
+            if ("denied" in choice) throw new PluginWriteError(choice.denied);
+            if (createOnly) deny(checkWrite(path, "create", writeFolders));
+            try {
+                if (!(await vault.writeNote(path, content, { mode: choice.mode }))) throw new PluginWriteError(`Failed to write note: ${path}`);
+            } catch (err) {
+                if (err instanceof NoteExistsError) throw new PluginWriteError(`Note already exists: ${path}`);
+                if (err instanceof NoteNotFoundError) throw new PluginWriteError(checkWrite(path, "create", writeFolders) ?? `Note not found: ${path}`);
+                throw err;
+            }
+            searchIndex.update(path, content, Date.now());
+        },
+        async editNote(path, apply) {
+            writable();
+            deny(checkWrite(path, "update", writeFolders));
+            const updated = await editNoteText(vault, path, apply);
+            if (updated === null) throw new PluginWriteError(`Note not found: ${path}`);
+            searchIndex.update(path, updated, Date.now());
+            return updated;
+        },
+        async deleteNote(path) {
+            writable();
+            deny(checkWrite(path, "delete", writeFolders));
+            if ((await vault.readNote(path)) === null) throw new PluginWriteError(`Note not found: ${path}`);
+            if (!(await vault.deleteNote(path))) throw new PluginWriteError(`Failed to delete: ${path}`);
+            searchIndex.remove(path);
+        },
+        async moveNote(from, to) {
+            writable();
+            deny(checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders));
+            const content = await vault.readNote(from);
+            try {
+                if (!(await vault.moveNote(from, to))) throw new PluginWriteError(`Failed to move: ${from} → ${to}`);
+            } catch (err) {
+                if (err instanceof NoteExistsError) throw new PluginWriteError(`A note already exists at ${to}.`);
+                throw err;
+            }
+            searchIndex.remove(from);
+            if (content !== null) searchIndex.update(to, content, Date.now());
+        },
+    };
+}
+
+export interface LoadOptions {
+    server: ToolServer;
+    toolNames: Set<string>;
+    vault: VaultBackend;
+    searchIndex: SearchIndex;
+    vaultName: string;
+    readOnly: boolean;
+    writeFolders: WriteScope;
+}
+
+/** Load every plugin in `dir`. Throws, naming the file, on the first one that fails. Returns the files loaded. */
+export async function loadPlugins(dir: string, options: LoadOptions): Promise<string[]> {
+    const root = resolve(dir);
+    const files = (await readdir(root, { withFileTypes: true }))
+        .filter((e) => e.isFile() && /\.(m?js)$/.test(e.name))
+        .map((e) => e.name)
+        .sort();
+    const vault = guardedVault(options.vault, options.searchIndex, options.writeFolders, options.readOnly);
+    for (const file of files) {
+        const where = `plugin ${file}`;
+        let plugin: unknown;
+        try {
+            plugin = (await import(pathToFileURL(join(root, file)).href)).default;
+        } catch (err) {
+            throw new Error(`${where} failed to load: ${(err as Error).message}`);
+        }
+        if (typeof plugin !== "function") throw new Error(`${where} has no default export function.`);
+        const ctx: PluginContext = {
+            vaultName: options.vaultName,
+            readOnly: options.readOnly,
+            z,
+            vault,
+            log: (message) => console.log(`[${file}] ${message}`),
+            addTool: (tool) => {
+                if (!tool || typeof tool.name !== "string" || !TOOL_NAME.test(tool.name)) {
+                    throw new Error(`${where}: tool name must match ${TOOL_NAME}, got ${JSON.stringify(tool?.name)}.`);
+                }
+                if (options.toolNames.has(tool.name)) throw new Error(`${where}: a tool named ${tool.name} already exists.`);
+                if (typeof tool.execute !== "function" || !tool.parameters) throw new Error(`${where}: tool ${tool.name} needs parameters and execute.`);
+                const execute = tool.execute;
+                options.server.addTool({
+                    ...tool,
+                    // A refused write is an answer for the agent, not a server error.
+                    execute: async (args: unknown, c: unknown) => {
+                        try {
+                            return await execute(args, c);
+                        } catch (err) {
+                            if (err instanceof PluginWriteError) return err.message;
+                            throw err;
+                        }
+                    },
+                });
+            },
+        };
+        try {
+            await (plugin as Plugin)(ctx);
+        } catch (err) {
+            throw new Error(`${where} failed during setup: ${(err as Error).message}`);
+        }
+    }
+    return files;
+}

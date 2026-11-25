@@ -18,6 +18,7 @@ import { redactCredentials, describeError, describeLogMessage } from "./redact.j
 import { parsePathNormalization, type PathNormalizationSetting } from "./path-identity-config.js";
 import { declareUtf8Charset } from "./http-charset.js";
 import { CouchOpStore } from "./op-store.js";
+import { loadPlugins, trackToolNames } from "./plugins.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -50,6 +51,8 @@ const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const READ_ONLY = process.env.READ_ONLY === "true";
 // Idempotency records for op_id (see op-store.ts); off unless set.
 const OPS_DATABASE = process.env.OPS_DATABASE?.trim() || undefined;
+// Extra tools from this directory (see plugins.ts); off unless set.
+const PLUGIN_DIR = process.env.PLUGIN_DIR?.trim() || undefined;
 let WRITE_FOLDERS: WriteScope;
 try {
     WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
@@ -478,6 +481,7 @@ if (AUTH_TOKEN) {
 }
 
 const server = new FastMCP(serverOptions);
+const toolNames = trackToolNames(server);
 
 if (AUTH_TOKEN) {
     const tokenPath = join(dataDir, "auth-tokens.json");
@@ -542,6 +546,16 @@ if (ATTACHMENTS_ENABLED) {
             ? "Attachments enabled (read-only: get_attachment_metadata only)."
             : `Attachments enabled: ${ATTACHMENT_WRITE_TOOLS.join(", ")}; uploads up to ${formatBytes(ATTACHMENT_MAX_BYTES)} via ${BASE_URL}/attachments/upload/<token>.`,
     );
+}
+
+if (PLUGIN_DIR) {
+    try {
+        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS });
+        console.log(`Plugins from ${PLUGIN_DIR}: ${loaded.length ? loaded.join(", ") : "none found"}.`);
+    } catch (err) {
+        console.error(`PLUGIN_DIR: ${(err as Error).message}`);
+        process.exit(1);
+    }
 }
 
 // --- Graceful shutdown ---
