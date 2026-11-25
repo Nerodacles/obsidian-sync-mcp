@@ -499,6 +499,18 @@ step("Notes: create-only across two instances on one database");
     assert.equal(await a.deleteNote("Inbox/kept.md"), true);
     const again = await Promise.allSettled([a.writeNote("Inbox/kept.md", "again a", { mode: "create" }), b.writeNote("Inbox/kept.md", "again b", { mode: "create" })]);
     assert.equal(again.filter((r) => r.status === "fulfilled").length, 1, "one re-create wins");
+    // With LiveSync's "delete metadata of deleted files" the document is a real
+    // CouchDB deletion instead; create works on top of that too.
+    assert.equal(await a.writeNote("Inbox/purged.md", "old", { mode: "create" }), true);
+    const purgedId = await (a as any).manipulator.path2id("Inbox/purged.md");
+    const head = await fetch(`${base.couchdbUrl}/createonlyvault/${encodeURIComponent(purgedId)}`, { headers: auth });
+    const { _rev } = (await head.json()) as any;
+    const del = await fetch(`${base.couchdbUrl}/createonlyvault/${encodeURIComponent(purgedId)}?rev=${_rev}`, { method: "DELETE", headers: auth });
+    assert.ok(del.ok, `raw delete: ${del.status}`);
+    assert.equal(await b.readNote("Inbox/purged.md"), null);
+    assert.equal(await b.writeNote("Inbox/purged.md", "new", { mode: "create" }), true);
+    assert.equal(await a.readNote("Inbox/purged.md"), "new");
+    await assert.rejects(() => a.writeNote("Inbox/purged.md", "newer", { mode: "create" }), NoteExistsError);
     await a.close();
     await b.close();
     console.log("create-only holds across two instances, deleted notes can be created again once");

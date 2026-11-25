@@ -460,11 +460,43 @@ export class Vault implements VaultBackend {
     }
 
     /**
-     * Write a note as a child of `baseRevision` with a plain (non-forced) put,
-     * so CouchDB itself refuses it when another writer advanced the note first.
-     * Returns the new revision, or false when CouchDB refused it.
+     * Create a note only if none exists, in one CouchDB request, so it holds
+     * across server instances: a put without a base revision, which CouchDB
+     * refuses (409) while a live document is there and accepts on top of a
+     * CouchDB deletion. A note deleted through LiveSync is a live document
+     * marked `deleted`; it is created again as a child of that revision, which
+     * CouchDB likewise refuses if someone else got there first.
      */
-    private async putAtRevision(path: string, id: DocumentID, content: string, ctime: number, baseRevision: string): Promise<string | false> {
+    private async createNoteUnlocked(path: string, content: string): Promise<boolean> {
+        const id = await this.manipulator.path2id(path as FilePathWithPrefix);
+        const base = await this.softDeletedRevision(path, id);
+        if (await this.putAtRevision(path, id, content, Date.now(), base)) return true;
+        // The library answers false both for a 409 and for a write it could not
+        // store at all; only the document's current state tells the two apart.
+        const now = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, undefined, true);
+        if (now && now._rev !== base) throw new NoteExistsError(path);
+        throw new Error(`CouchDB did not store the new note ${path}`);
+    }
+
+    /** undefined: no live document. A revision: a document LiveSync marked deleted. Throws NoteExistsError for a live note. */
+    private async softDeletedRevision(path: string, id: DocumentID): Promise<string | undefined> {
+        let doc: { _rev: string; deleted?: boolean };
+        try {
+            doc = await this.manipulator.liveSyncLocalDB.localDatabase.get(id);
+        } catch (err) {
+            if ((err as { status?: number })?.status === 404) return undefined;
+            throw err;
+        }
+        if (doc.deleted) return doc._rev;
+        throw new NoteExistsError(path);
+    }
+
+    /**
+     * Write a note as a child of `baseRevision` (none: a new document) with a
+     * plain, non-forced put, so CouchDB refuses it when the document has moved
+     * on. Returns the new revision, or false when the write was refused.
+     */
+    private async putAtRevision(path: string, id: DocumentID, content: string, ctime: number, baseRevision: string | undefined): Promise<string | false> {
         const data = createTextBlob(content);
         const type = determineTypeFromBlob(data);
         const doc = {
@@ -479,7 +511,8 @@ export class Vault implements VaultBackend {
             eden: {},
             children: [] as string[],
         } as SavingEntry;
-        const result = await this.manipulator.liveSyncLocalDB.putDBEntryWithLiveBaseRevision(doc, baseRevision);
+        // Without a base revision the put carries no _rev, which CouchDB accepts only for a new document.
+        const result = await this.manipulator.liveSyncLocalDB.putDBEntryWithLiveBaseRevision(doc, baseRevision as string);
         return result ? result.rev : false;
     }
 
@@ -490,19 +523,19 @@ export class Vault implements VaultBackend {
     }
 
     /**
-     * The create/update checks rely on the caller holding the document's lock.
-     * Replacing an existing note is a revision-checked put, retried on a 409
-     * (the new text doesn't depend on the old one), so a concurrent write
-     * through another instance of this server can't leave a conflict revision
-     * with it. Obsidian's edits arrive by LiveSync replication, which has no
-     * revision check, and are still left to LiveSync's conflict handling.
-     * Creating a missing note is still the library's forced put: two instances
-     * creating the same new note at the same moment can still conflict.
+     * "create" is checked by CouchDB itself (see createNoteUnlocked), so it holds
+     * across server instances sharing a database. Replacing an existing note is a
+     * revision-checked put, retried on a 409 (the new text doesn't depend on the
+     * old one), so a concurrent write through another instance of this server
+     * can't leave a conflict revision with it. Obsidian's edits arrive by LiveSync
+     * replication, which has no revision check, and are still left to LiveSync's
+     * conflict handling.
      */
     private async writeNoteUnlocked(path: string, id: DocumentID, content: string, { mode = "upsert", maxAttempts = OVERWRITE_MAX_ATTEMPTS, minRetryMs = 0 }: NoteWriteOptions): Promise<boolean> {
         // Clear cached PBKDF2 salt so we re-fetch from CouchDB before encrypting.
         // Prevents stale salt after Obsidian "Overwrite remote" rebuilds (issue #686).
         clearHandlers();
+        if (mode === "create") return await this.createNoteUnlocked(path, content);
 
         const existing = await this.manipulator.get(path as FilePathWithPrefix, true);
         if (existing && mode === "create") throw new NoteExistsError(path);
