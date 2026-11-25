@@ -84,8 +84,10 @@ export class SearchIndex {
     private content = new Map<string, string>();
     /** Frontmatter `title:` per path, when present — searched together with the path. */
     private titles = new Map<string, string>();
+    /** Frontmatter `aliases` per path, when present. */
+    private aliases = new Map<string, string[]>();
     /**
-     * Hash of the text each note's tags, links and title were parsed from.
+     * Hash of the text each note's tags, links, title and aliases were parsed from.
      * Persisted, so the startup rebuild skips parsing notes that haven't changed.
      */
     private hashes = new Map<string, string>();
@@ -133,6 +135,7 @@ export class SearchIndex {
             if (data.parser === PARSER_VERSION) {
                 for (const [path, h] of Object.entries(data.hashes ?? {})) this.hashes.set(path, h as string);
                 for (const [path, t] of Object.entries(data.titles ?? {})) this.titles.set(path, t as string);
+                for (const [path, a] of Object.entries(data.aliases ?? {})) this.aliases.set(path, a as string[]);
             }
             for (const [path, v] of Object.entries(data.attachments ?? {})) {
                 const [size, mtime] = v as [number, number];
@@ -159,6 +162,7 @@ export class SearchIndex {
                 parser: PARSER_VERSION,
                 hashes: Object.fromEntries(this.hashes),
                 titles: Object.fromEntries(this.titles),
+                aliases: Object.fromEntries(this.aliases),
                 attachments: Object.fromEntries([...this.attachments].map(([p, a]) => [p, [a.size, a.mtime]])),
                 since: this._since,
             });
@@ -182,7 +186,7 @@ export class SearchIndex {
      * not newer than the one recorded for text already held is skipped: a
      * stale copy can never replace a newer one. Mtimes loaded from disk carry
      * no text, so the startup rebuild still fills them in; when the text's
-     * hash matches the one saved, the saved tags, links and title are kept
+     * hash matches the one saved, the saved tags, links, title and aliases are kept
      * and the note isn't parsed again.
      */
     update(path: string, content: string, mtime?: number): void {
@@ -207,6 +211,11 @@ export class SearchIndex {
             this.titles.set(path, title.trim());
         } else {
             this.titles.delete(path);
+        }
+        if (parsed.aliases.length > 0) {
+            this.aliases.set(path, parsed.aliases);
+        } else {
+            this.aliases.delete(path);
         }
         if (parsed.tags.length > 0) {
             this.tags.set(path, parsed.tags);
@@ -235,6 +244,7 @@ export class SearchIndex {
             this.tags.delete(path);
             this.content.delete(path);
             this.titles.delete(path);
+            this.aliases.delete(path);
             this.hashes.delete(path);
             this.clearBacklinks(path);
         }
@@ -342,6 +352,11 @@ export class SearchIndex {
     /** Get tags for a path. */
     getTags(path: string): string[] {
         return this.tags.get(path) ?? [];
+    }
+
+    /** Get the frontmatter aliases of a path. */
+    getAliases(path: string): string[] {
+        return this.aliases.get(path) ?? [];
     }
 
     /** Get outgoing links for a path. */

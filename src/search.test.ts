@@ -274,6 +274,21 @@ describe("SearchIndex persistence", () => {
             assert.deepEqual(second.getBacklinks("Other"), ["t.md"]);
             assert.equal(second.search({ terms: ["kanban"] }).hits[0]?.nameHit, true, "title kept");
         });
+
+        it("keeps the aliases of an unchanged note across a restart", async () => {
+            const path = join(tmpDir, "aliases.json");
+            const text = "---\naliases: [Veg patch]\n---\nBody";
+            const first = new SearchIndex(path);
+            first.update("Projects/Garden plan.md", text, 1);
+            assert.deepEqual(first.getAliases("Projects/Garden plan.md"), ["Veg patch"]);
+            await first.saveToDisk();
+            const second = new SearchIndex(path);
+            await second.loadFromDisk();
+            second.update("Projects/Garden plan.md", text, 1);
+            assert.deepEqual(second.getAliases("Projects/Garden plan.md"), ["Veg patch"]);
+            second.remove("Projects/Garden plan.md");
+            assert.deepEqual(second.getAliases("Projects/Garden plan.md"), []);
+        });
     });
 });
 
