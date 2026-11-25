@@ -275,6 +275,19 @@ describe("SearchIndex persistence", () => {
             assert.equal(second.search({ terms: ["kanban"] }).hits[0]?.nameHit, true, "title kept");
         });
 
+        it("keeps summary and case of an unchanged note across a restart", async () => {
+            const path = join(tmpDir, "nameprops.json");
+            const text = "---\nsummary: Raised beds\ncase: watering schedule\n---\nBody";
+            const first = new SearchIndex(path);
+            first.update("Projects/Beds.md", text, 1);
+            await first.saveToDisk();
+            const second = new SearchIndex(path);
+            await second.loadFromDisk();
+            second.update("Projects/Beds.md", text, 1);
+            assert.equal(second.search({ terms: ["raised beds"] }).hits[0]?.nameHit, true);
+            assert.equal(second.search({ terms: ["watering"] }).hits[0]?.nameHit, true);
+        });
+
         it("keeps the aliases of an unchanged note across a restart", async () => {
             const path = join(tmpDir, "aliases.json");
             const text = "---\naliases: [Veg patch]\n---\nBody";
@@ -286,6 +299,7 @@ describe("SearchIndex persistence", () => {
             await second.loadFromDisk();
             second.update("Projects/Garden plan.md", text, 1);
             assert.deepEqual(second.getAliases("Projects/Garden plan.md"), ["Veg patch"]);
+            assert.equal(second.search({ terms: ["veg patch"] }).hits[0]?.nameHit, true, "alias is a name hit after the restart");
             second.remove("Projects/Garden plan.md");
             assert.deepEqual(second.getAliases("Projects/Garden plan.md"), []);
         });
@@ -320,10 +334,77 @@ describe("SearchIndex content search (search_notes)", () => {
         assert.equal(hits[1].matched, 1);
     });
 
-    it("a term may contain spaces and matches a phrase in another word order only if present", () => {
-        const { total } = seeded().search({ terms: ["drag i kanban"] });
-        assert.equal(total, 0, "phrase with different word order does not match");
-        assert.equal(seeded().search({ terms: ["drag i appens kanban"] }).total, 1);
+    it("a term with spaces matches when all its words occur, in any order", () => {
+        assert.deepEqual(seeded().search({ terms: ["drag i kanban"] }).hits.map((h) => h.path), ["marvin/labels.md"]);
+        assert.deepEqual(seeded().search({ terms: ["kanban appens drag"] }).hits.map((h) => h.path), ["marvin/labels.md"]);
+        assert.equal(seeded().search({ terms: ["drag i appens kanban"] }).total, 1, "the exact phrase still matches");
+        assert.equal(seeded().search({ terms: ["drag kanban missing"] }).total, 0, "every word must occur");
+    });
+
+    it("words match whole: a word inside a longer word does not match", () => {
+        const idx = new SearchIndex();
+        idx.update("Garden/Tools.md", "Rotate the backups of the shed inventory.", 1);
+        idx.update("Garden/Power.md", "The UPS keeps the pump running.", 2);
+        assert.deepEqual(idx.search({ terms: ["ups"] }).hits.map((h) => h.path), ["Garden/Power.md"]);
+        assert.deepEqual(idx.search({ terms: ["backup"] }).hits, [], "no prefix matching either");
+        assert.equal(idx.search({ terms: ["the shed"] }).total, 1);
+        assert.deepEqual(idx.search({ terms: ["ups."] }).hits.map((h) => h.path), [], "punctuation in a word is matched as written");
+        assert.deepEqual(idx.search({ terms: ["inventory."] }).hits.map((h) => h.path), ["Garden/Tools.md"]);
+    });
+
+    it("a hyphen and a space are the same between words", () => {
+        const idx = new SearchIndex();
+        idx.update("Projects/Drill.md", "Plan for a site-loss drill.", 1);
+        idx.update("Projects/Notes.md", "What a site loss would cost.", 2);
+        const byHyphen = idx.search({ terms: ["site-loss"] }).hits.map((h) => h.path).sort();
+        const bySpace = idx.search({ terms: ["site loss"] }).hits.map((h) => h.path).sort();
+        assert.deepEqual(byHyphen, ["Projects/Drill.md", "Projects/Notes.md"]);
+        assert.deepEqual(bySpace, byHyphen);
+    });
+
+    it("a term made only of hyphens and spaces matches nothing", () => {
+        const idx = new SearchIndex();
+        idx.update("Projects/Garden plan.md", "---\ntitle: x\n---\nBody", 1);
+        assert.equal(idx.search({ terms: ["---"] }).total, 0);
+    });
+
+    it("aliases, summary and case rank with path and title, above body hits", () => {
+        const idx = new SearchIndex();
+        idx.update("Projects/Body only.md", "We talked about the compost heap today.", 300);
+        idx.update("Projects/Garden plan.md", "---\naliases: [Compost heap]\n---\nBeds and paths.", 100);
+        idx.update("Projects/Soil.md", "---\nsummary: Notes on the compost heap\n---\nPH values.", 110);
+        idx.update("Projects/Case.md", "---\ncase: compost heap smell\n---\nResolved.", 120);
+        const { hits } = idx.search({ terms: ["compost heap"] });
+        assert.deepEqual(hits.map((h) => [h.path, h.nameHit]), [
+            ["Projects/Case.md", true],
+            ["Projects/Soil.md", true],
+            ["Projects/Garden plan.md", true],
+            ["Projects/Body only.md", false],
+        ]);
+    });
+
+    it("a name hit needs all of a term's words in the name fields", () => {
+        const idx = new SearchIndex();
+        idx.update("Projects/Garden plan.md", "Spring sowing.", 1);
+        const { hits } = idx.search({ terms: ["garden sowing"] });
+        assert.equal(hits.length, 1, "matches across name and text");
+        assert.equal(hits[0].nameHit, false);
+    });
+
+    it("exclude leaves folders out and counts what it left out", () => {
+        const idx = new SearchIndex();
+        idx.update("Archive/old.md", "compost", 1);
+        idx.update("Archive/older.md", "compost", 2);
+        idx.update("Archived/x.md", "compost", 3);
+        idx.update("Projects/new.md", "compost", 4);
+        const r = idx.search({ terms: ["compost"], exclude: ["Archive/"] });
+        assert.deepEqual(r.hits.map((h) => h.path).sort(), ["Archived/x.md", "Projects/new.md"]);
+        assert.equal(r.total, 2);
+        assert.equal(r.excluded, 2);
+        const inside = idx.search({ terms: ["compost"], folder: "Archive", exclude: ["Archive/"] });
+        assert.equal(inside.total, 2, "an explicit folder inside an excluded one lifts the exclusion");
+        assert.equal(inside.excluded, 0);
+        assert.equal(idx.search({ terms: ["nothing"], exclude: ["Archive/"] }).excluded, 0);
     });
 
     it("term matching is case-insensitive for non-ASCII letters", () => {

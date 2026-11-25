@@ -2,7 +2,7 @@
  * Metadata index for vault notes.
  *
  * Tracks paths, mtimes, tags, links, and backlinks, and keeps the decrypted
- * note text in memory for `search_notes` (substring search over content).
+ * note text in memory for `search_notes` (whole-word search over content).
  * Metadata persists to disk (encrypted if passphrase is set); the content map
  * is rebuilt from the vault at startup and is never written to disk.
  */
@@ -40,9 +40,18 @@ function decrypt(data: string, passphrase: string): string {
 export type IndexState = "building" | "ready" | "failed";
 
 export interface SearchQuery {
-    /** Case-insensitive substrings; a note matches when ANY term occurs (OR). A term may contain spaces. */
+    /**
+     * A note matches when ANY term matches (OR). A term matches when ALL its
+     * words occur, in any order (see termWords); words match whole,
+     * case-insensitively.
+     */
     terms?: string[];
     folder?: string;
+    /**
+     * Folder prefixes left out unless `folder` lies inside one of them (see
+     * parseSearchExclude). Hits there are counted in `excluded`, not returned.
+     */
+    exclude?: string[];
     tag?: string;
     /** Only notes with mtime >= this (ms since epoch). */
     modifiedAfter?: number;
@@ -54,7 +63,10 @@ export interface SearchHit {
     mtime: number;
     /** Distinct terms that matched in path/title or content. */
     matched: number;
-    /** True when the path or the frontmatter title matched. Name hits rank first. */
+    /**
+     * True when a term matched on its own in the path, the frontmatter title,
+     * the aliases or the `summary` / `case` properties. Name hits rank first.
+     */
     nameHit: boolean;
     /** One line of context around the first content match; whitespace collapsed. Empty for a name-only hit. */
     snippet: string;
@@ -66,6 +78,58 @@ export function snippetAround(text: string, idx: number, len: number, context = 
     const end = Math.min(text.length, idx + len + context);
     const body = text.slice(start, end).replace(/\s+/g, " ").trim();
     return (start > 0 ? "…" : "") + body + (end < text.length ? "…" : "");
+}
+
+/** Properties searched together with the path and title, besides `aliases`. */
+export const NAME_PROPERTIES = ["summary", "case"] as const;
+
+// Letters, combining marks and digits are word characters: a word of the
+// term may not continue into one of them in the note.
+const WORD = "[\\p{L}\\p{M}\\p{N}]";
+const IS_WORD = new RegExp(WORD, "u");
+
+/**
+ * The words of a search term, lowercased and without duplicates. Spaces and
+ * hyphens separate words, so "site-loss" and "site loss" give the same words;
+ * any other character, punctuation included, is part of a word. A term made
+ * only of spaces and hyphens (e.g. "---") has no words and matches nothing.
+ */
+export function termWords(term: string): string[] {
+    return [...new Set(term.toLowerCase().split(/[\s-]+/u).filter((w) => w.length > 0))];
+}
+
+/**
+ * Case-insensitive (Unicode) match of `word` as a whole word: where the word
+ * starts or ends with a word character, the note may not have another word
+ * character right before or after it. "ups" matches "UPS" and "ups," but not
+ * "backups"; "[[welcome]]" and "projects/" match as written.
+ */
+function wordRegex(word: string): RegExp {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const chars = Array.from(word);
+    const before = IS_WORD.test(chars[0]) ? `(?<!${WORD})` : "";
+    const after = IS_WORD.test(chars[chars.length - 1]) ? `(?!${WORD})` : "";
+    return new RegExp(before + escaped + after, "iu");
+}
+
+/**
+ * SEARCH_DEFAULT_EXCLUDE: comma-separated folder prefixes, each normalised to
+ * "folder/" (backslashes as slashes, leading and trailing slashes dropped),
+ * so "Archive" leaves out "Archive/old.md" but not "Archived/x.md".
+ */
+export function parseSearchExclude(raw: string | undefined): string[] {
+    const folders = (raw ?? "")
+        .split(",")
+        .map((f) => f.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+        .filter((f) => f.length > 0)
+        .map((f) => f + "/");
+    return [...new Set(folders)];
+}
+
+/** The excluded folders that apply to a search in `folder`: one that `folder` lies inside is asked for, so it is lifted. */
+export function activeExcludes(exclude: string[], folder: string | undefined): string[] {
+    const prefix = folder ? (folder.endsWith("/") ? folder : folder + "/") : undefined;
+    return exclude.filter((ex) => !(prefix && prefix.startsWith(ex)));
 }
 
 export interface AttachmentEntry {
@@ -80,12 +144,14 @@ export class SearchIndex {
     private links = new Map<string, string[]>();
     private backlinks = new Map<string, Set<string>>();
     private knownPaths = new Set<string>();
-    /** Decrypted note text, in memory only — one copy per note; term matching is case-insensitive via a regex per term. */
+    /** Decrypted note text, in memory only — one copy per note; word matching is case-insensitive via a regex per word. */
     private content = new Map<string, string>();
     /** Frontmatter `title:` per path, when present — searched together with the path. */
     private titles = new Map<string, string>();
     /** Frontmatter `aliases` per path, when present. */
     private aliases = new Map<string, string[]>();
+    /** Frontmatter `summary` and `case` per path, when present, one per line — searched together with the path. */
+    private nameProps = new Map<string, string>();
     /**
      * Hash of the text each note's tags, links, title and aliases were parsed from.
      * Persisted, so the startup rebuild skips parsing notes that haven't changed.
@@ -136,6 +202,7 @@ export class SearchIndex {
                 for (const [path, h] of Object.entries(data.hashes ?? {})) this.hashes.set(path, h as string);
                 for (const [path, t] of Object.entries(data.titles ?? {})) this.titles.set(path, t as string);
                 for (const [path, a] of Object.entries(data.aliases ?? {})) this.aliases.set(path, a as string[]);
+                for (const [path, n] of Object.entries(data.nameProps ?? {})) this.nameProps.set(path, n as string);
             }
             for (const [path, v] of Object.entries(data.attachments ?? {})) {
                 const [size, mtime] = v as [number, number];
@@ -163,6 +230,7 @@ export class SearchIndex {
                 hashes: Object.fromEntries(this.hashes),
                 titles: Object.fromEntries(this.titles),
                 aliases: Object.fromEntries(this.aliases),
+                nameProps: Object.fromEntries(this.nameProps),
                 attachments: Object.fromEntries([...this.attachments].map(([p, a]) => [p, [a.size, a.mtime]])),
                 since: this._since,
             });
@@ -217,6 +285,12 @@ export class SearchIndex {
         } else {
             this.aliases.delete(path);
         }
+        const props = NAME_PROPERTIES.map((k) => parsed.frontmatter[k]?.trim()).filter((v) => v);
+        if (props.length > 0) {
+            this.nameProps.set(path, props.join("\n"));
+        } else {
+            this.nameProps.delete(path);
+        }
         if (parsed.tags.length > 0) {
             this.tags.set(path, parsed.tags);
         } else {
@@ -245,6 +319,7 @@ export class SearchIndex {
             this.content.delete(path);
             this.titles.delete(path);
             this.aliases.delete(path);
+            this.nameProps.delete(path);
             this.hashes.delete(path);
             this.clearBacklinks(path);
         }
@@ -261,18 +336,28 @@ export class SearchIndex {
     }
 
     /**
-     * Search over path + frontmatter title first, then the in-memory text.
-     * Ranked: name hits first, then number of distinct terms matched, then
-     * newest first, then path. `limit` defaults to 20.
+     * Search over the name fields (path, frontmatter title, aliases, `summary`
+     * and `case`) and the in-memory text. A term matches a note when each of
+     * its words occurs as a whole word in the name fields or the text; it is a
+     * name hit when all its words occur in the name fields. Ranked: name hits
+     * first, then number of distinct terms matched, then newest first, then
+     * path. `limit` defaults to 20. `excluded` counts the matching notes left
+     * out by `exclude`.
      */
-    search(q: SearchQuery): { hits: SearchHit[]; total: number } {
+    search(q: SearchQuery): { hits: SearchHit[]; total: number; excluded: number } {
         const prefix = q.folder ? (q.folder.endsWith("/") ? q.folder : q.folder + "/") : undefined;
-        const terms = (q.terms ?? []).filter((t) => t.length > 0).map((t) => ({
-            text: t.toLowerCase(),
-            // Case-insensitive (Unicode) search over the note text without a lowercased copy of the vault in memory.
-            re: new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu"),
-        }));
+        const exclude = activeExcludes(q.exclude ?? [], q.folder);
+        // One regex per distinct word, shared by every term that has it.
+        const regexes = new Map<string, RegExp>();
+        const terms = (q.terms ?? [])
+            .map((t) => termWords(t))
+            .filter((words) => words.length > 0)
+            .map((words) => {
+                for (const w of words) if (!regexes.has(w)) regexes.set(w, wordRegex(w));
+                return words;
+            });
         const hits: SearchHit[] = [];
+        let excluded = 0;
         for (const [path, entry] of this.content) {
             // Mirror the ingest filter (GHSA-hfcr-mrh3-c584): the content map is
             // only fed validated paths, so this is defense in depth, not a gate.
@@ -281,27 +366,40 @@ export class SearchIndex {
             if (q.tag && !this.getTags(path).includes(q.tag)) continue;
             const mtime = this.mtimes.get(path) ?? 0;
             if (q.modifiedAfter !== undefined && mtime < q.modifiedAfter) continue;
-            // Step 1: path and title. Step 2: content. A term counts once even if it hits both.
-            const title = this.titles.get(path);
-            const name = title ? `${path} ${title}` : path;
-            const nameLower = name.toLowerCase();
+            const name = [path, this.titles.get(path), ...(this.aliases.get(path) ?? []), this.nameProps.get(path)]
+                .filter((v) => v)
+                .join("\n");
+            // Each word is looked up at most once per note, in the name fields and in the text.
+            const inName = new Map<string, boolean>();
+            const inText = new Map<string, number>();
+            const nameHas = (w: string) => {
+                if (!inName.has(w)) inName.set(w, regexes.get(w)!.test(name));
+                return inName.get(w)!;
+            };
+            const textAt = (w: string) => {
+                if (!inText.has(w)) inText.set(w, entry.search(regexes.get(w)!));
+                return inText.get(w)!;
+            };
             let matched = 0;
             let nameHit = false;
             let anchor = -1;
             let anchorLen = 1;
-            {
-                for (const t of terms) {
-                    const inName = nameLower.includes(t.text);
-                    const i = entry.search(t.re);
-                    if (!inName && i === -1) continue;
-                    matched++;
-                    if (inName) nameHit = true;
+            for (const words of terms) {
+                if (!words.every((w) => nameHas(w) || textAt(w) !== -1)) continue;
+                matched++;
+                if (words.every(nameHas)) nameHit = true;
+                for (const w of words) {
+                    const i = textAt(w);
                     if (i !== -1 && (anchor === -1 || i < anchor)) {
                         anchor = i;
-                        anchorLen = t.text.length;
+                        anchorLen = w.length;
                     }
                 }
-                if (matched === 0) continue;
+            }
+            if (matched === 0) continue;
+            if (exclude.some((ex) => path.startsWith(ex))) {
+                excluded++;
+                continue;
             }
             const snippet = anchor === -1 ? "" : snippetAround(entry, anchor, anchorLen);
             hits.push({ path, mtime, matched, nameHit, snippet });
@@ -313,7 +411,7 @@ export class SearchIndex {
                 b.mtime - a.mtime ||
                 a.path.localeCompare(b.path),
         );
-        return { hits: hits.slice(0, q.limit ?? 20), total: hits.length };
+        return { hits: hits.slice(0, q.limit ?? 20), total: hits.length, excluded };
     }
 
     /** Remove all backlink entries where path is the source. */

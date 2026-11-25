@@ -9,11 +9,11 @@ import { SUPPORTED_ATTACHMENT_EXTENSIONS, isValidAttachmentPath } from "./attach
 /**
  * Changes whenever parseFrontmatterAndLinks may return something different for
  * the same note, so metadata the search index saved from an older parser is
- * parsed again, not reused. Bump the number when changing the parser; the
- * attachment extensions are part of it because they decide which link targets
- * count.
+ * parsed again, not reused. Bump the number when changing the parser or what
+ * the index keeps from its result; the attachment extensions are part of it
+ * because they decide which link targets count.
  */
-export const PARSER_VERSION = `5:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
+export const PARSER_VERSION = `6:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
 
 export interface NoteMetadata {
     frontmatter: Record<string, string>;
