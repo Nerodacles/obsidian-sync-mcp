@@ -4,7 +4,18 @@ import { makeDeepLink } from "./deeplink.js";
 import { NoteExistsError, NoteNotFoundError, type VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
-import { describeListing, describeNoMatch } from "./list-format.js";
+import { describeIndexState, describeListing, describeNoMatch } from "./list-format.js";
+import {
+    QUERY_DEFAULT_LIMIT,
+    QUERY_MAX_CONDITIONS,
+    QUERY_MAX_LIMIT,
+    QUERY_OPS,
+    QueryError,
+    describeRows,
+    describeTotal,
+    runQuery,
+    toJson,
+} from "./query.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
@@ -270,6 +281,79 @@ export function registerTools(
             const { hits, total } = searchIndex.search({ terms: cleanTerms, folder, tag, modifiedAfter, limit: cap });
             const query = describeQuery(cleanTerms);
             return `${describeSync(status)}\n${describeHits(hits, total, query, (p) => makeDeepLink(vaultName, p))}`;
+        },
+    });
+
+    const scalar = z.union([z.string().max(1000), z.number(), z.boolean()]);
+    server.addTool({
+        name: "query_notes",
+        description:
+            "Filter notes by frontmatter properties, with an exact total.\n" +
+            "Reads only the metadata index, never note bodies. The first line always states how many notes match and which ones are shown, " +
+            "e.g. '412 notes match; showing 1-50; next cursor: …' — pass that cursor back with the same where/sort/folder/tag for the next page. " +
+            "Examples: where=[{field:'type',op:'eq',value:'recipe'},{field:'status',op:'ne',value:'done'}], sort={field:'priority'}, select=['title','status','updated']. " +
+            "Operators: eq, ne, in (value is a list), contains (a list holds the value, or a text contains it; case-insensitive), exists, missing, lt, gt (numbers as numbers, ISO dates as dates, else text). " +
+            "On a list property eq/in/lt/gt hold when any element does, ne when none equals; ne and missing also match notes without the field. " +
+            "Pseudo-fields: path, folder (parent folder, '' at the root), tags (frontmatter and inline tags), mtime (takes an ISO date or milliseconds). " +
+            "Rows show `title` as the frontmatter title or else the file name (in where/sort it is only the property). A 'Note:' second line carries index or catch-up warnings. format='json' returns {total, shown, start, next_cursor, index, warnings, rows}.",
+        parameters: z.object({
+            where: z
+                .array(
+                    z.object({
+                        field: z.string().min(1).max(200).describe("Frontmatter property, or path, folder, tags, mtime."),
+                        op: z.enum(QUERY_OPS),
+                        value: z.union([scalar, z.array(scalar).max(100)]).optional().describe("Omit for exists/missing; a list for in."),
+                    }),
+                )
+                .max(QUERY_MAX_CONDITIONS)
+                .optional()
+                .describe("Conditions, all of which must hold (AND). Omit to match every note."),
+            select: z
+                .array(z.string().min(1).max(200))
+                .max(30)
+                .optional()
+                .describe("Fields to show per note besides the path. Default ['title']."),
+            sort: z
+                .object({
+                    field: z.string().min(1).max(200),
+                    order: z.enum(["asc", "desc"]).optional().describe("Default asc."),
+                })
+                .optional()
+                .describe("One field. Notes without it come last either way; ties, and the order without a sort, by path."),
+            limit: z.coerce
+                .number()
+                .int()
+                .min(1)
+                .max(QUERY_MAX_LIMIT)
+                .optional()
+                .describe(`Rows per page, default ${QUERY_DEFAULT_LIMIT}, at most ${QUERY_MAX_LIMIT}.`),
+            cursor: z.string().max(4000).optional().describe("The `next cursor` of the previous page."),
+            folder: z.string().optional().describe("Only notes in this folder and its subfolders."),
+            tag: z.string().optional().describe("Only notes carrying this tag."),
+            format: z.enum(["text", "json"]).optional().describe("'text' (default) or 'json' for scripts."),
+        }),
+        execute: async ({ where, select, sort, limit, cursor, folder, tag, format }) => {
+            const sync = syncBeforeSearch ? await syncBeforeSearch() : { unreadable: 0 };
+            let res;
+            try {
+                res = runQuery(searchIndex.queryRecords(folder, tag), { where, select, sort, limit, cursor, folder, tag });
+            } catch (err) {
+                if (err instanceof QueryError) return err.message;
+                throw err;
+            }
+            const warnings: string[] = [];
+            const indexNote = describeIndexState({ state: searchIndex.state, size: searchIndex.size }).trim();
+            if (indexNote) warnings.push(indexNote);
+            else if (searchIndex.size === 0) warnings.push("Index: holds no notes; query_notes reads only the index.");
+            if (sync.error) warnings.push(`Catch-up with the vault failed (${sync.error}); results may be stale.`);
+            if (sync.unreadable > 0) warnings.push(`${sync.unreadable} document(s) could not be read and are not counted.`);
+            if (res.unknownFields.length > 0) {
+                warnings.push(`No note has ${res.unknownFields.map((f) => JSON.stringify(f)).join(", ")}; check the spelling with get_note_metadata.`);
+            }
+            if (format === "json") return toJson(res, { index: searchIndex.state, warnings });
+            // Warnings get their own line, so the cursor stays the last token of the first.
+            const head = warnings.length > 0 ? [describeTotal(res), `Note: ${warnings.join(" ")}`] : [describeTotal(res)];
+            return [...head, ...describeRows(res.rows, (p) => makeDeepLink(vaultName, p))].join("\n");
         },
     });
 

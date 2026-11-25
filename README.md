@@ -207,10 +207,31 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | `list_folders` | List all folders in the vault with note counts — use to discover folder names |
 | `list_tags` | List all tags in the vault with counts — use to discover tags before filtering |
 | `list_notes` | List notes with timestamps. Filter by folder, name, tag, or date. Sort by name or modified. |
+| `query_notes` | Filter notes by frontmatter properties (`eq`, `ne`, `in`, `contains`, `exists`, `missing`, `lt`, `gt`, all AND), choose the fields shown, sort by one field, and page with a cursor. The first line always states the exact number of matches. See [Querying properties](#querying-properties). |
 | `search_notes` | Search note text for terms (OR, case-insensitive substrings); paths and frontmatter titles are searched first. Filter by folder, tag, or date. Returns paths with one context line each, never the note body, after a status line that states which CouchDB sequence the index is caught up with. |
 | `delete_note` | Delete a note |
 | `move_note` | Move or rename a note — works across folders, creates destination folders automatically |
 | `get_note_metadata` | Get frontmatter, tags, outgoing links, backlinks, size, and timestamps — navigate the knowledge graph |
+
+### Querying properties
+
+`query_notes` answers questions such as "every recipe still in draft" or "ready projects by priority" from the metadata index, without reading note bodies:
+
+```
+query_notes(where=[{field: "type", op: "eq", value: "recipe"}, {field: "status", op: "eq", value: "draft"}])
+query_notes(where=[{field: "status", op: "eq", value: "ready"}], sort={field: "priority"}, select=["title", "priority", "updated"])
+```
+
+```
+37 notes match; showing 1-37.
+- [Projects/Garden plan.md](obsidian://...) · title: Garden plan · priority: 1 · updated: 2026-03-10
+```
+
+- **Fields:** any frontmatter property, plus `path`, `folder` (the parent folder, `""` at the vault root), `tags` (frontmatter and inline tags) and `mtime`. These four win over a property of the same name. A property with an empty value counts as missing.
+- **Operators:** `eq`, `ne`, `in` (the value is a list), `contains`, `exists`, `missing`, `lt`, `gt`. Conditions are combined with AND. `eq`, `ne` and `in` are exact and case-sensitive. A number as value compares numerically, so `priority eq 2` matches `priority: 2`. `contains` is case-insensitive: on a list property it means "the list has this element", on text "the text contains this substring". `lt`/`gt` compare numbers as numbers and ISO dates (`2026-03-25`, `2026-03-25T10:00`, read as UTC without a zone) as dates. Everything else is compared as text. A number is never compared with a date or with text. On a list property, `eq`, `in`, `lt` and `gt` hold when any element does, and `ne` holds when none equals. `ne` and `missing` also match notes that don't have the field.
+- **Output:** `select` picks the fields shown after the path (default `title`, which is the frontmatter title or else the file name; in `where` and `sort`, `title` is only the property). Lists are joined with `, ` and values over 200 characters are cut with a `… [+N chars]` marker. `format: "json"` returns `{total, shown, start, next_cursor, index, warnings, rows}` with values never cut and `null` for a missing field.
+- **Sort and paging:** sort by one field, `asc` (default) or `desc`. Notes missing the field come last either way, and ties are broken by path. `limit` defaults to 50 (at most 500). When more notes match, the first line ends with `next cursor: …`. Pass that cursor with the same `where`, `sort`, `folder` and `tag` for the next page; `select`, `limit` and `format` may change. The cursor holds the last row's sort value and path, so the next page starts right after that row even if notes were added or removed in between. The total and the position are counted again on every page. A note whose sort value changed between pages can appear twice or not at all.
+- **Freshness:** in CouchDB mode the index catches up with the change feed before each query, as for `search_notes`. While the index is still being built, or if the catch-up failed, a `Note:` line right after the first line says so.
 
 ### Attachments (opt-in)
 
