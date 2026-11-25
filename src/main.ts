@@ -17,6 +17,7 @@ import { UploadRegistry, mountAttachmentUpload } from "./uploads.js";
 import { redactCredentials, describeError, describeLogMessage } from "./redact.js";
 import { parsePathNormalization, type PathNormalizationSetting } from "./path-identity-config.js";
 import { declareUtf8Charset } from "./http-charset.js";
+import { describePrincipals, matchPrincipal, parsePrincipals, type Principal } from "./principals.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -55,6 +56,24 @@ try {
     process.exit(1);
 }
 for (const warning of writeScopeWarnings(WRITE_FOLDERS)) console.warn(warning);
+
+// Named tokens (see principals.ts): replaces MCP_AUTH_TOKEN and WRITE_FOLDERS.
+const MCP_TOKENS_FILE = process.env.MCP_TOKENS_FILE?.trim() || undefined;
+let PRINCIPALS: Principal[] | null = null;
+if (MCP_TOKENS_FILE) {
+    if (AUTH_TOKEN || WRITE_FOLDERS !== null) {
+        console.error("MCP_TOKENS_FILE replaces MCP_AUTH_TOKEN and WRITE_FOLDERS: give each token its permissions in the file and unset both.");
+        process.exit(1);
+    }
+    try {
+        PRINCIPALS = parsePrincipals(readFileSync(MCP_TOKENS_FILE, "utf8"));
+    } catch (err) {
+        console.error(`MCP_TOKENS_FILE (${MCP_TOKENS_FILE}): ${(err as Error).message}`);
+        process.exit(1);
+    }
+    // Calls outside a recognised token's scope write nothing (see registerTools).
+    WRITE_FOLDERS = [];
+}
 
 // Attachments (images, PDFs, audio, video) are opt-in.
 const ATTACHMENTS_ENABLED = process.env.ATTACHMENTS_ENABLED === "true";
@@ -429,7 +448,16 @@ const serverOptions: ConstructorParameters<typeof FastMCP>[0] = {
 import type { AuthHandle } from "./auth.js";
 let auth: AuthHandle | null = null;
 
-if (AUTH_TOKEN) {
+if (PRINCIPALS) {
+    const principals = PRINCIPALS;
+    serverOptions.authenticate = async (req: import("http").IncomingMessage) => {
+        const p = matchPrincipal(principals, req.headers["authorization"]);
+        // Checked on every request; the session's principal follows the token of the request.
+        if (p) return { authenticated: true, principal: { name: p.name, scope: p.scope } };
+        throw new Response("Unauthorized", { status: 401 });
+    };
+    console.log(`Auth enabled (named tokens): ${describePrincipals(principals)}.`);
+} else if (AUTH_TOKEN) {
     serverOptions.authenticate = async (req: import("http").IncomingMessage) => {
         const header = req.headers["authorization"];
         // Accept static Bearer token (for curl, MCP Inspector, custom agents)
@@ -483,7 +511,7 @@ if (AUTH_TOKEN) {
 }
 
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined);
+registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined, PRINCIPALS !== null);
 
 if (ATTACHMENTS_ENABLED) {
     const uploadRegistry = new UploadRegistry({ ttlMs: ATTACHMENT_UPLOAD_TTL_SECONDS * 1000 });
@@ -493,6 +521,7 @@ if (ATTACHMENTS_ENABLED) {
         vaultName: VAULT_NAME,
         readOnly: READ_ONLY,
         writeFolders: WRITE_FOLDERS,
+        namedTokens: PRINCIPALS !== null,
         allowedExtensions: ATTACHMENT_EXTENSIONS,
         maxBytes: ATTACHMENT_MAX_BYTES,
         base64MaxBytes: ATTACHMENT_INLINE_MAX_BYTES,

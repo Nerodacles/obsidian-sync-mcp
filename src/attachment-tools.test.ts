@@ -8,6 +8,7 @@ import { SUPPORTED_ATTACHMENT_EXTENSIONS } from "./attachment-path.js";
 import { SearchIndex } from "./search.js";
 import { AttachmentTooLargeError, AttachmentMoveIncompleteError } from "./vault-backend.js";
 import { parseWriteFolders } from "./write-scope.js";
+import { runAsPrincipal } from "./principals.js";
 
 type Tool = { name: string; description: string; parameters: any; execute: (args: any) => Promise<string> };
 
@@ -479,5 +480,21 @@ describe("upload URL flow under WRITE_FOLDERS (tool + PUT route)", () => {
         const { call, registry } = flow("Raw:create");
         assert.equal(await call("create_attachment_upload", { path: "Other/a.png" }), "Write access denied: 'Other/a.png' is outside the writable folders (Raw/ (create only)).");
         assert.equal(registry.pending, 0);
+    });
+});
+
+describe("named tokens: attachment writes use the caller's token scope", () => {
+    it("writes inside the token's folders, refuses outside, and refuses with no principal scope", async () => {
+        // As main.ts does with MCP_TOKENS_FILE: the static scope is "nothing writable".
+        const { call } = setup({ writeFolders: [], namedTokens: true });
+        const alice = parseWriteFolders("Media");
+        const ok = await runAsPrincipal("alice", alice, () => call("write_attachment", { path: "Media/a.png", content_base64: "AAAA" }));
+        assert.match(String(ok), /^Attachment saved|^Saved|Media\/a\.png/);
+        const outside = await runAsPrincipal("alice", alice, () => call("write_attachment", { path: "Other/a.png", content_base64: "AAAA" }));
+        assert.match(String(outside), /^Write access denied/);
+        const upload = await runAsPrincipal("bob", [], () => call("create_attachment_upload", { path: "Media/b.png", size: 3 }));
+        assert.match(String(upload), /^Write access denied: this caller may not write/);
+        // Outside any call scope the static scope applies: nothing writable.
+        assert.match(String(await call("write_attachment", { path: "Media/c.png", content_base64: "AAAA" })), /^Write access denied/);
     });
 });

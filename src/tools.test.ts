@@ -558,3 +558,60 @@ describe("revisions (expected_revision)", () => {
         assert.match(await tool.execute(tool.parameters.parse({ path: "Raw/a.md", content: "v2", expected_revision: "1-a" }), {}), /allows only create/);
     });
 });
+
+describe("named tokens: each call's write scope comes from its token", () => {
+    async function setup() {
+        const root = await mkdtemp(join(tmpdir(), "tools-principal-"));
+        const vault = new LocalVault(root);
+        await vault.writeNote("Inbox/a.md", "a");
+        await vault.writeNote("Projects/p.md", "p");
+        const tools: any[] = [];
+        // As main.ts does with MCP_TOKENS_FILE: the static scope is "nothing writable".
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, vault, new SearchIndex(), "vault", false, [], undefined, true);
+        const as = (name: string | null, scope: string | null) => (tool: string, args: any): Promise<string> => {
+            const t = tools.find((x) => x.name === tool);
+            const session = name === null ? undefined : { principal: { name, scope: scope === "*" ? null : scope === "-" ? [] : parseWriteFolders(scope!) } };
+            return t.execute(t.parameters.parse(args), { session });
+        };
+        return { vault, as, tools, cleanup: () => rm(root, { recursive: true, force: true }) };
+    }
+
+    it("a token writes only inside its own permissions", async () => {
+        const { vault, as, cleanup } = await setup();
+        try {
+            const alice = as("alice", "Inbox:create+update");
+            assert.match(await alice("write_note", { path: "Inbox/new.md", content: "n" }), /^Note saved/);
+            assert.match(await alice("edit_note", { path: "Inbox/a.md", content: "more" }), /^Note edited/);
+            assert.match(await alice("write_note", { path: "Projects/p.md", content: "x" }), /Projects\/p\.md/);
+            assert.match(await alice("edit_note", { path: "Projects/p.md", content: "x" }), /Projects\/p\.md/);
+            assert.match(await alice("delete_note", { path: "Inbox/a.md" }), /delete/);
+            assert.match(await alice("move_note", { from: "Inbox/a.md", to: "Projects/a.md" }), /delete|Projects/);
+            assert.equal(await vault.readNote("Projects/p.md"), "p");
+            assert.equal(await vault.readNote("Inbox/a.md"), "a\nmore");
+            // Another token on the same server has its own scope.
+            const ops = as("ops", "*");
+            assert.match(await ops("write_note", { path: "Projects/p.md", content: "by ops" }), /^Note saved/);
+            assert.equal(await vault.readNote("Projects/p.md"), "by ops");
+        } finally { await cleanup(); }
+    });
+
+    it("a read-only token, or a call without a principal, writes nothing", async () => {
+        const { vault, as, cleanup } = await setup();
+        try {
+            for (const caller of [as("bob", "-"), as(null, null)]) {
+                assert.ok(!(await caller("write_note", { path: "Inbox/b.md", content: "x" })).startsWith("Note saved"));
+                assert.ok(!(await caller("edit_note", { path: "Inbox/a.md", content: "x" })).startsWith("Note edited"));
+                assert.match(await caller("read_note", { path: "Inbox/a.md" }), /\n\na$/);
+            }
+            assert.equal(await vault.readNote("Inbox/b.md"), null);
+            assert.equal(await vault.readNote("Inbox/a.md"), "a");
+        } finally { await cleanup(); }
+    });
+
+    it("tool descriptions say the scope depends on the token", async () => {
+        const { tools, cleanup } = await setup();
+        try {
+            assert.ok(tools.find((t) => t.name === "write_note").description.endsWith(" Which folders may be written depends on the caller's token."));
+        } finally { await cleanup(); }
+    });
+});

@@ -6,6 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
+import { currentPrincipal, currentWriteScope, runAsPrincipal } from "./principals.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -105,18 +106,32 @@ export function registerTools(
     readOnly = false,
     writeFolders: WriteScope = null,
     syncBeforeSearch?: SyncBeforeSearch,
+    /** MCP_TOKENS_FILE is in use: each call's write scope comes from its token (session.principal). */
+    namedTokens = false,
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
+    } else if (namedTokens) {
+        console.log("Named tokens: each caller's writes are limited by its own token's permissions.");
     } else if (writeFolders) {
         console.log(`WRITE_FOLDERS: writes restricted to ${describeFolders(writeFolders)}.`);
     }
-    const writeScopeNote = describeWriteScope(writeFolders);
+    const writeScopeNote = namedTokens ? " Which folders may be written depends on the caller's token." : describeWriteScope(writeFolders);
+    // The scope of the call being served: the caller's token's with named tokens, else WRITE_FOLDERS.
+    const scope = () => currentWriteScope(writeFolders);
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
         const original = tool.execute;
         tool.execute = async (args: any, ctx: any) => {
-            if (debugLogging) console.log(`[tool] ${tool.name}(${JSON.stringify(args)})`);
+            if (namedTokens) {
+                // Fail closed: a call without a recognised token may write nothing.
+                const who = ctx?.session?.principal as { name: string; scope: WriteScope } | undefined;
+                return runAsPrincipal(who?.name ?? "(unknown)", who ? who.scope : [], () => run(args, ctx));
+            }
+            return run(args, ctx);
+        };
+        const run = async (args: any, ctx: any) => {
+            if (debugLogging) console.log(`[tool] ${tool.name}(${JSON.stringify(args)})${currentPrincipal() ? ` by ${currentPrincipal()}` : ""}`);
             const start = performance.now();
             const result = await original(args, ctx);
             if (debugLogging) console.log(`[tool] ${tool.name} → ${((performance.now() - start)).toFixed(0)}ms`);
@@ -157,7 +172,7 @@ export function registerTools(
         execute: async ({ path, content, expected_revision }) => {
             if (expected_revision !== undefined) {
                 // A revision names an existing note, so this is an update.
-                const denied = checkWrite(path, "update", writeFolders);
+                const denied = checkWrite(path, "update", scope());
                 if (denied) return denied;
                 if (!vault.updateNote) return NO_REVISIONS_MESSAGE;
                 try {
@@ -173,10 +188,10 @@ export function registerTools(
             // Whether this is a create or an update depends on the note existing,
             // so pass what's allowed down and let the backend decide in the same
             // step as the write.
-            const allow = allowedActions(path, writeFolders);
+            const allow = allowedActions(path, scope());
             const canCreate = allow.has("create");
             const canUpdate = allow.has("update");
-            if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders)!;
+            if (!canCreate && !canUpdate) return checkWrite(path, "create", scope())!;
             const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
             let ok: boolean;
             try {
@@ -185,9 +200,9 @@ export function registerTools(
                 ok = await vault.writeNote(path, content, { mode, maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
             } catch (err) {
                 if (err instanceof NoteExistsError) {
-                    return `${checkWrite(path, "update", writeFolders)} The note already exists; choose a new path.`;
+                    return `${checkWrite(path, "update", scope())} The note already exists; choose a new path.`;
                 }
-                if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders)!;
+                if (err instanceof NoteNotFoundError) return checkWrite(path, "create", scope())!;
                 if (err instanceof UpdateRetriesExhaustedError) {
                     return `Failed to write note: ${path} kept changing during ${err.attempts} attempts. Nothing was written; try again.`;
                 }
@@ -423,7 +438,7 @@ export function registerTools(
             expected_revision: expectedRevisionParam,
         }),
         execute: async ({ path, content: newContent, operation, old_text, expected_revision }) => {
-            const denied = checkWrite(path, "update", writeFolders);
+            const denied = checkWrite(path, "update", scope());
             if (denied) return denied;
             const op = operation ?? "append";
 
@@ -489,7 +504,7 @@ export function registerTools(
             path: z.string().describe("Vault-relative path to the note to delete"),
         }),
         execute: async ({ path }) => {
-            const denied = checkWrite(path, "delete", writeFolders);
+            const denied = checkWrite(path, "delete", scope());
             if (denied) return denied;
             // The sync layer reports success even when nothing existed at the
             // path, so "Deleted" would claim a cleanup that never happened.
@@ -512,7 +527,7 @@ export function registerTools(
         }),
         execute: async ({ from, to }) => {
             // A move deletes at the source and creates at the destination.
-            const denied = checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders);
+            const denied = checkWrite(from, "delete", scope()) ?? checkWrite(to, "create", scope());
             if (denied) return denied;
             const content = await vault.readNote(from);
             let ok: boolean;

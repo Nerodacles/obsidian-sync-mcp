@@ -200,6 +200,7 @@ export function checkWrite(path: string, action: WriteAction, scope: WriteScope)
     // Name the rule that withholds the action (with case variants, possibly the folded one).
     const rule = rules.find((r) => !r.allow.has(action));
     if (!rule) {
+        if (scope && scope.length === 0) return `Write access denied: this caller may not write, so '${path}' can't be ${VERB[action]}.`;
         return `Write access denied: '${path}' is outside the writable folders (${describeFolders(scope ?? [])}).`;
     }
     const allowed = WRITE_ACTIONS.filter((a) => rule.allow.has(a)).join("+");

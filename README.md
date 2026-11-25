@@ -223,6 +223,21 @@ Several agents, or several server instances on one database, can edit the same n
 
 Local mode has no revisions: reads show none, and `expected_revision` is refused rather than ignored. `delete_note` and `move_note` do not check revisions yet (except a case-only rename on a case-insensitive vault, which rewrites the one note like `write_note`). Edits made in Obsidian reach CouchDB through LiveSync replication, which has no revision check; an Obsidian edit racing an agent edit is still left to LiveSync's conflict handling.
 
+### Named tokens (opt-in)
+
+To give several agents one server with different rights, list their tokens in `MCP_TOKENS_FILE`, one per line:
+
+```
+# name   SHA-256 of the token  permissions
+writer   sha256:<64 hex digits>  Inbox:create,Projects
+reader   sha256:<64 hex digits>  -
+```
+
+- The file holds only SHA-256 digests (`printf %s "$TOKEN" | sha256sum`); a line with a plain token stops startup.
+- Permissions are `*` (anywhere), `-` (read-only) or a `WRITE_FOLDERS` value without spaces. Each request is checked against its own token, so a token can't write outside its permissions even on a session opened with another token.
+- Rotate a token by listing the name twice with the new digest and the same permissions, restarting, moving clients to the new token, then removing the old line and restarting. The file is read at startup only.
+- The token's name is shown in debug logs of each tool call and is available to tools for provenance. Only static bearer tokens are accepted in this mode; the password-gated OAuth login needs `MCP_AUTH_TOKEN`.
+
 ### Attachments (opt-in)
 
 With `ATTACHMENTS_ENABLED=true`, agents can also store images, PDFs, audio and video in the vault. In CouchDB mode they are written through livesync-commonlib, chunked and encrypted the same way as a file added in Obsidian, so they sync to every device.
@@ -297,6 +312,7 @@ Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable fo
 | `DISPLAY_TIMEZONE` | Optional | server's zone | IANA time zone for the human-readable half of the server time in `search_notes` status lines (UTC is always printed beside it), e.g. `Europe/Berlin`. An invalid zone falls back to UTC with a warning at startup |
 | `MCP_REFRESH_DAYS` | Optional | `14` | Days before auth session expires |
 | `READ_ONLY` | Optional | `false` | Set to `true` to disable all write tools (`write_note`, `edit_note`, `delete_note`, `move_note`). Only read tools are exposed via MCP, and the vault backend rejects writes as well. Useful when sharing the server with multiple AI clients and write access should be opt-in. This protects the vault from MCP clients; it is not a database-level guarantee. To make CouchDB itself refuse writes, use CouchDB-side controls, such as a `validate_doc_update` function that rejects the server's CouchDB user. |
+| `MCP_TOKENS_FILE` | Optional | — | Path to a file of named bearer tokens, each with its own write permissions; replaces `MCP_AUTH_TOKEN` and `WRITE_FOLDERS` (setting either with it stops startup). See [Named tokens](#named-tokens-opt-in). |
 | `WRITE_FOLDERS` | Optional | — | Comma-separated list of vault-relative folders where agents may write (e.g. `MCP,Inbox`). The whole vault stays readable; paths outside the listed folders are read-only. Add permissions after a colon to limit a folder: `create` (add new files), `update` (change existing files) and `delete` (delete files or move them away), joined with `+`. A folder without permissions gets all three. For example `MCP,Raw:create,Notes:create+update`: anything goes in `MCP`, agents can add to `Raw` but never overwrite, edit, move or delete what is there, and can add and edit in `Notes` but not delete. `move_note` and `move_attachment` need `delete` at the source and `create` at the destination, and never replace an existing note. An attachment is replaced only with `overwrite=true`, which needs both `create` and `update`, so attachments can't be replaced in an `update`-only folder. The most specific folder applies, so `Raw:create,Raw/scratch` makes `Raw/scratch` fully writable; `/` stands for the vault root (`/,Raw:create` makes everything writable except `Raw`). Matching is folder-boundary-aware (`MCP` matches `MCP/note.md` but not `MCP-private/note.md`). Paths are compared the way the vault resolves them: `\` counts as `/`, and a case variant of a folder (`raw/`) gets only what both spellings allow, since LiveSync, macOS and Windows treat them as one folder. The server refuses to start on an unknown permission, a folder listed twice (case variants included) or a folder that can never match. Enforced server-side, unlike `MCP_INSTRUCTIONS`; in local mode, writes, deletes and moves through a symlink (to a file or a folder) are refused while it is set, since the check sees the requested path; reads still follow symlinks. Ignored when `READ_ONLY=true`; unset or empty means the whole vault is writable. |
 | `ATTACHMENTS_ENABLED` | Optional | `false` | Set to `true` to enable the [attachment tools](#attachments-opt-in) and the upload endpoint. Under `READ_ONLY=true` only `get_attachment_metadata` and `list_attachments` are exposed and the endpoint is not mounted. With CouchDB, startup then always reads the change feed from the beginning to learn existing attachments (it already does so whenever notes are indexed, to rebuild the search text) |
 | `ATTACHMENT_MAX_BYTES` | Optional | `20971520` (20 MB) | Largest file accepted by an upload URL. The whole file is held in memory while it is written |

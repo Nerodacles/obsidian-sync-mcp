@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **Named tokens (`MCP_TOKENS_FILE`, opt-in).** One server can accept several bearer tokens, each with a name and its own `WRITE_FOLDERS`-style permissions (`*`, `-` for read-only, or folders with create/update/delete). Tokens are stored as SHA-256 digests, several can be valid at once for rotation, and each request is checked against its own token. Without the setting, `MCP_AUTH_TOKEN` and `WRITE_FOLDERS` work as before.
+
+### Tests
+- `npm run test:named-tokens`: permissions per token, unknown token, a borrowed session, and rotation, against a local vault.
+
 ## 0.14.0
 
 ### Features

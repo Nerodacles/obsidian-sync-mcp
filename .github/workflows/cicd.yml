@@ -83,6 +83,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm run test:e2e
+      - run: npm run test:named-tokens
 
   # E2E: CouchDB mode against a real CouchDB — exercises the LiveSync write
   # path and the Obfuscate Properties auto-detection (issues #4, #10)

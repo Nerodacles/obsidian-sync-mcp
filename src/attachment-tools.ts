@@ -7,6 +7,7 @@
  * because every byte of a tool argument is a model output token.
  */
 
+import { currentWriteScope } from "./principals.js";
 import type { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
@@ -26,6 +27,8 @@ export interface AttachmentToolOptions {
     vaultName: string;
     readOnly: boolean;
     writeFolders: WriteScope;
+    /** MCP_TOKENS_FILE is in use: the scope of each call comes from its token. */
+    namedTokens?: boolean;
     allowedExtensions: ReadonlySet<string>;
     /** Largest file accepted by the upload URL. */
     maxBytes: number;
@@ -70,7 +73,7 @@ export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOpt
     const { vault, searchIndex, vaultName, readOnly, writeFolders, allowedExtensions, maxBytes, base64MaxBytes, registry } = opts;
     const baseUrl = opts.baseUrl.replace(/\/+$/, "");
     const extList = [...allowedExtensions].sort().join(", ");
-    const writeScopeNote = describeWriteScope(writeFolders);
+    const writeScopeNote = opts.namedTokens ? " Which folders may be written depends on the caller's token." : describeWriteScope(writeFolders);
     const embedNote = " Add it to a note with an embed such as ![[path]] (edit_note).";
 
     /** Validate against the configured allowlist; returns an error message or null. */
@@ -84,7 +87,7 @@ export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOpt
     };
     /** Path validation, then each write action needed at `path`. */
     const checkWritable = (path: string, ...actions: WriteAction[]): string | null =>
-        checkPath(path) ?? actions.map((a) => checkWrite(path, a, writeFolders)).find((m) => m !== null) ?? null;
+        checkPath(path) ?? actions.map((a) => checkWrite(path, a, currentWriteScope(writeFolders))).find((m) => m !== null) ?? null;
     /**
      * Writing to a path that may not exist creates it; overwrite=true may also
      * replace a file there, so it needs update too.
@@ -92,7 +95,7 @@ export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOpt
     const writeActions = (overwrite: boolean | undefined): WriteAction[] => (overwrite ? ["create", "update"] : ["create"]);
     const exists = (path: string) =>
         `Attachment already exists: ${path}. ` +
-        (allowedActions(path, writeFolders).has("update") ? "Pass overwrite=true to replace it, or choose another path." : "Choose another path.");
+        (allowedActions(path, currentWriteScope(writeFolders)).has("update") ? "Pass overwrite=true to replace it, or choose another path." : "Choose another path.");
 
     server.addTool({
         name: "get_attachment_metadata",
