@@ -377,7 +377,7 @@ console.log("\n=== Server modes (on E2EE+obfuscated+ID key / NFC) ===");
         try {
             const c = await connect(s);
             const names = (await c.listTools()).tools.map((t) => t.name);
-            for (const w of ["write_note", "edit_note", "delete_note", "move_note"]) assert.ok(!names.includes(w), `${w} exposed`);
+            for (const w of ["write_note", "edit_note", "delete_note", "move_note", "rename_note"]) assert.ok(!names.includes(w), `${w} exposed`);
             assert.match(await call(c, "read_note", { path: "Projects/Plan.md" }), /Roadmap/);
             await c.close();
         } finally { await stopServer(s); }

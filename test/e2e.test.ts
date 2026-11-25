@@ -321,6 +321,19 @@ describe("E2E: move_note", () => {
     });
 });
 
+describe("E2E: rename_note", () => {
+    it("renames a note, rewrites the links to it and keeps the old name as an alias", async () => {
+        await callTool("write_note", { path: "garden/Garden plan.md", content: "# Beds\n" });
+        await callTool("write_note", { path: "garden/log.md", content: "[[Garden plan#Beds|beds]] [p](Garden%20plan.md) `[[Garden plan]]`\n" });
+        const text = await callTool("rename_note", { from: "garden/Garden plan.md", to: "garden/2026/Spring planting.md" });
+        assert.match(text, /^Renamed: garden\/Garden plan\.md → garden\/2026\/Spring planting\.md$/m);
+        assert.match(text, /^- Rewritten: garden\/log\.md \(2 links\)$/m);
+        assert.equal(readFileSync(join(vaultDir, "garden/log.md"), "utf-8"), "[[Spring planting#Beds|beds]] [p](2026/Spring%20planting.md) `[[Garden plan]]`\n");
+        assert.equal(readFileSync(join(vaultDir, "garden/2026/Spring planting.md"), "utf-8"), "---\naliases:\n  - Garden plan\n---\n# Beds\n");
+        assert.ok(!existsSync(join(vaultDir, "garden/Garden plan.md")));
+    });
+});
+
 describe("E2E: delete_note", () => {
     it("does not claim to have deleted a note that does not exist", async () => {
         const text = await callTool("delete_note", { path: "archive/never-existed.md" });
@@ -590,7 +603,7 @@ describe("E2E: READ_ONLY mode", () => {
 
         const list = await mcpCall("tools/list", {});
         const tools: string[] = (list?.result?.tools ?? []).map((t: any) => t.name);
-        for (const w of ["write_note", "edit_note", "delete_note", "move_note"]) {
+        for (const w of ["write_note", "edit_note", "delete_note", "move_note", "rename_note"]) {
             assert.ok(!tools.includes(w), `${w} should not be registered in READ_ONLY mode`);
         }
         for (const r of ["read_note", "list_notes", "list_folders", "list_tags", "get_note_metadata"]) {
@@ -725,7 +738,7 @@ describe("E2E: WRITE_FOLDERS permissions", () => {
             ), serverLogs);
             const list = await mcpCall("tools/list", {});
             const tools: any[] = list?.result?.tools ?? [];
-            for (const name of ["write_note", "edit_note", "delete_note", "move_note", "write_attachment", "create_attachment_upload", "delete_attachment", "move_attachment"]) {
+            for (const name of ["write_note", "edit_note", "delete_note", "move_note", "rename_note", "write_attachment", "create_attachment_upload", "delete_attachment", "move_attachment"]) {
                 const desc: string = tools.find((t) => t.name === name)?.description ?? "";
                 assert.match(desc, /Writes are only allowed inside: \/ \(create only\), MCP\/, Raw\/ \(create only\).*the most specific folder applies\./, name);
             }
