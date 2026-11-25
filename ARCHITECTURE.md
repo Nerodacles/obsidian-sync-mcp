@@ -143,7 +143,7 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 
 ## Tools (`src/tools.ts`)
 
-10 tools registered via FastMCP:
+13 tools registered via FastMCP:
 
 | Tool | Reads from | Writes to |
 |---|---|---|
@@ -157,6 +157,9 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 | `get_note_metadata` | vault + index (backlinks) | — |
 | `move_note` | vault | vault + index |
 | `delete_note` | — | vault + index |
+| `list_conflicts` | vault (CouchDB `_find` on `_conflicts`) | — |
+| `get_conflict` | vault (every live leaf) | — |
+| `resolve_conflict` | vault | vault + index |
 
 ## Build (`tsup.config.ts`)
 

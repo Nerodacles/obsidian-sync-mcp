@@ -11,10 +11,11 @@ import type { MetaEntry } from "../lib/livesync-commonlib/src/API/DirectFileMani
 import { isPathProbablyObfuscated, decrypt } from "octagonal-wheels/encryption/encryption";
 import { clearHandlers } from "../lib/livesync-commonlib/src/replication/SyncParamsHandler.ts";
 import { PouchDB } from "../lib/livesync-commonlib/src/pouchdb/pouchdb-http.ts";
+import { isErrorOfMissingDoc } from "../lib/livesync-commonlib/src/pouchdb/utils_couchdb.ts";
 import { inspectDatabasePathIdentity, type PathIdentityInspection } from "../lib/livesync-commonlib/src/pouchdb/pathIdentityCompatibility.ts";
 import type { EntryDoc } from "../lib/livesync-commonlib/src/common/types.ts";
 import { parseFrontmatterAndLinks } from "./parse.js";
-import { AttachmentExistsError, AttachmentMoveIncompleteError, AttachmentTooLargeError, NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type RevisedNote, type UpdateOptions, type UpdateResult, type NoteWriteOptions, type MoveOptions, type VaultBackend, type NoteInfo, type NoteListing, type AttachmentInfo, type AttachmentChangeCallback, type WriteOptions } from "./vault-backend.js";
+import { AttachmentExistsError, AttachmentMoveIncompleteError, ConflictChangedError, ConflictLeafUnreadableError, type ConflictDetail, type ConflictLeaf, type ConflictResolution, type ConflictResolved, type ConflictListing, AttachmentTooLargeError, NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type RevisedNote, type UpdateOptions, type UpdateResult, type NoteWriteOptions, type MoveOptions, type VaultBackend, type NoteInfo, type NoteListing, type AttachmentInfo, type AttachmentChangeCallback, type WriteOptions } from "./vault-backend.js";
 import { KeyedLock } from "./keyed-lock.js";
 import { validateNotePath, isValidNotePath } from "./note-path.js";
 import { validateAttachmentPath, isValidAttachmentPath } from "./attachment-path.js";
@@ -37,6 +38,24 @@ class WriteNotStoredError extends Error {
         super(`CouchDB did not store the write to ${path}`);
         this.name = "WriteNotStoredError";
     }
+}
+
+/** Page size of the `_find` query that lists conflicted notes. */
+const CONFLICT_PAGE = 200;
+
+function sameRevisions(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    const sorted = [...b].sort();
+    return [...a].sort().every((rev, i) => rev === sorted[i]);
+}
+
+function isConflictStatus(ex: unknown): boolean {
+    return !!ex && typeof ex === "object" && "status" in ex && ex.status === 409;
+}
+
+function textOf(entry: { data?: unknown }): string | null {
+    if (Array.isArray(entry.data)) return entry.data.join("");
+    return typeof entry.data === "string" ? entry.data : null;
 }
 
 export interface VaultConfig {
@@ -409,9 +428,149 @@ export class Vault implements VaultBackend {
 
     async readNoteRevision(path: string): Promise<RevisedNote | null> {
         this.validatePath(path);
-        const entry = await this.manipulator.get(path as FilePathWithPrefix);
+        // `conflicts: true` adds the other live leaves to the same fetch.
+        const entry = await this.manipulator.liveSyncLocalDB.getDBEntry(path as FilePathWithPrefix, { conflicts: true });
         if (!entry || !("data" in entry) || !Array.isArray(entry.data) || !entry._rev) return null;
-        return { content: entry.data.join(""), revision: entry._rev };
+        return { content: entry.data.join(""), revision: entry._rev, conflicts: entry._conflicts ?? [] };
+    }
+
+    /**
+     * Conflicted notes come from one Mango `_find` on `_conflicts`, paged by
+     * bookmark. CouchDB evaluates the selector on every document (there is no
+     * index, and creating one would write a design document into the vault
+     * database that every LiveSync device replicates), but only conflicted
+     * documents are sent back, without bodies or chunks. Each one is then
+     * read again, metadata only, for its decrypted path and current leaves.
+     */
+    async listConflicts(folder?: string): Promise<ConflictListing> {
+        if (folder && !folder.endsWith("/")) folder += "/";
+        const db = this.manipulator.liveSyncLocalDB.localDatabase as any;
+        const ids: string[] = [];
+        let bookmark: string | undefined;
+        for (;;) {
+            const page = await db.find({
+                selector: { type: { $in: ["plain", "newnote"] }, _conflicts: { $exists: true } },
+                conflicts: true,
+                fields: ["_id"],
+                limit: CONFLICT_PAGE,
+                ...(bookmark ? { bookmark } : {}),
+            });
+            for (const doc of page.docs) if (!isNamespacedId(doc._id)) ids.push(doc._id);
+            if (page.docs.length < CONFLICT_PAGE || !page.bookmark) break;
+            bookmark = page.bookmark;
+        }
+        const listing: ConflictListing = { conflicts: [], unreadable: 0 };
+        for (const id of ids) {
+            let doc: any;
+            try {
+                doc = await db.get(id, { conflicts: true });
+            } catch (ex) {
+                if (isErrorOfMissingDoc(ex)) continue;
+                throw ex;
+            }
+            const conflicts: string[] = doc._conflicts ?? [];
+            if (conflicts.length === 0) continue;
+            let path: string = doc.path ?? "";
+            if (isPathProbablyObfuscated(path) && this.passphrase) {
+                try { path = await decrypt(path, this.passphrase, false); } catch {
+                    listing.unreadable++;
+                    continue;
+                }
+            }
+            if (!isValidNotePath(path)) continue;
+            if (folder && !path.startsWith(folder)) continue;
+            listing.conflicts.push({ path, revision: doc._rev, conflicts });
+        }
+        listing.conflicts.sort((a, b) => a.path.localeCompare(b.path));
+        return listing;
+    }
+
+    /** One leaf's metadata and text; the text is null when its chunks can't be read. */
+    private async readLeaf(path: string, meta: LoadedEntry): Promise<ConflictLeaf> {
+        let content: string | null = null;
+        try {
+            const loaded = await this.manipulator.liveSyncLocalDB.getDBEntryFromMeta(meta);
+            if (loaded) content = textOf(loaded);
+        } catch {
+            // Reported as unreadable below.
+        }
+        return { revision: meta._rev!, content, mtime: meta.mtime, size: meta.size, deleted: !!meta.deleted };
+    }
+
+    async getConflict(path: string): Promise<ConflictDetail | null> {
+        this.validatePath(path);
+        // includeDeleted: a LiveSync deletion is still a live leaf, and may be the winner.
+        const winner = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, { conflicts: true }, true);
+        if (!winner || !winner._rev) return null;
+        const others: ConflictLeaf[] = [];
+        for (const rev of winner._conflicts ?? []) {
+            let meta: false | LoadedEntry = false;
+            try {
+                meta = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, { rev }, true);
+            } catch (ex) {
+                if (!isErrorOfMissingDoc(ex)) throw ex;
+            }
+            others.push(meta ? await this.readLeaf(path, meta) : { revision: rev, content: null, mtime: 0, size: 0, deleted: false });
+        }
+        return { path, winner: await this.readLeaf(path, winner), others };
+    }
+
+    async resolveConflict(path: string, expectedLeaves: string[], resolution: ConflictResolution): Promise<ConflictResolved> {
+        this.validatePath(path);
+        const id = await this.manipulator.path2id(path as FilePathWithPrefix);
+        const leavesNow = async (): Promise<{ meta: LoadedEntry | false; leaves: string[] }> => {
+            const meta = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, { conflicts: true }, true);
+            return { meta, leaves: meta && meta._rev ? [meta._rev, ...(meta._conflicts ?? [])] : [] };
+        };
+        return await this.docLock.run([id], async () => {
+            clearHandlers();
+            const { meta, leaves } = await leavesNow();
+            if (!meta || !meta._rev) throw new NoteNotFoundError(path);
+            if (!sameRevisions(leaves, expectedLeaves)) throw new ConflictChangedError(path, expectedLeaves, leaves);
+            const winner = meta._rev;
+            const others = leaves.slice(1);
+            if (others.length === 0) return { revision: winner, content: null, removed: [], remaining: [] };
+
+            let text: string | null;
+            if ("keep" in resolution) {
+                if (!leaves.includes(resolution.keep)) throw new ConflictChangedError(path, expectedLeaves, leaves);
+                if (resolution.keep === winner) {
+                    text = null;
+                } else {
+                    const kept = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, { rev: resolution.keep }, true);
+                    if (!kept) throw new ConflictChangedError(path, expectedLeaves, (await leavesNow()).leaves);
+                    if (kept.deleted) throw new ConflictLeafUnreadableError(path, resolution.keep, "it is a deletion");
+                    const leaf = await this.readLeaf(path, kept);
+                    if (leaf.content === null) throw new ConflictLeafUnreadableError(path, resolution.keep, "its text could not be read");
+                    text = leaf.content;
+                }
+            } else {
+                text = resolution.content;
+            }
+
+            // Write first, on top of the winner and revision-checked: if that is
+            // refused, nothing has been deleted.
+            let revision = winner;
+            if (text !== null) {
+                clearHandlers();
+                const written = await this.putAtRevision(path, id, text, meta.ctime, winner);
+                if (!written) throw new ConflictChangedError(path, expectedLeaves, (await leavesNow()).leaves);
+                revision = written;
+            }
+            // Then each other leaf, deleted at its own revision: a leaf that moved
+            // on meanwhile answers 409 and stays, reported by the read-back.
+            const removed: string[] = [];
+            for (const rev of others) {
+                try {
+                    clearHandlers();
+                    if (await this.manipulator.liveSyncLocalDB.deleteDBEntry(path as FilePathWithPrefix, { rev })) removed.push(rev);
+                } catch (ex) {
+                    if (!isConflictStatus(ex) && !isErrorOfMissingDoc(ex)) throw ex;
+                }
+            }
+            const after = await leavesNow();
+            return { revision: after.leaves[0] ?? revision, content: text, removed, remaining: after.leaves.slice(1) };
+        });
     }
 
     async updateNote(path: string, apply: (content: string) => string, options: UpdateOptions = {}): Promise<UpdateResult> {
@@ -558,7 +717,7 @@ export class Vault implements VaultBackend {
 
     async getMetadata(path: string): Promise<NoteInfo | null> {
         this.validatePath(path);
-        const entry = await this.manipulator.get(path as FilePathWithPrefix);
+        const entry = await this.manipulator.liveSyncLocalDB.getDBEntry(path as FilePathWithPrefix, { conflicts: true });
         if (!entry) return null;
         const content = "data" in entry && Array.isArray(entry.data) ? entry.data.join("") : "";
         return {
@@ -567,6 +726,7 @@ export class Vault implements VaultBackend {
             ctime: entry.ctime,
             mtime: entry.mtime,
             revision: entry._rev,
+            conflicts: entry._conflicts ?? [],
             ...parseFrontmatterAndLinks(content),
         };
     }
