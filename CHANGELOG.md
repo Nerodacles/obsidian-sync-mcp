@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- `read_note` on a path that doesn't exist still answers `Note not found: <path>`, and now adds the notes whose file name or frontmatter `aliases` match the requested name, e.g. `Did you mean:` / `- Projects/Garden plan.md (alias "Veg patch")`.
+
+### Performance
+- The first start after upgrading parses every note once, to index aliases.
+
 ## 0.14.0
 
 ### Features
