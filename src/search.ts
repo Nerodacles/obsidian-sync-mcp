@@ -68,6 +68,14 @@ export function snippetAround(text: string, idx: number, len: number, context = 
     return (start > 0 ? "…" : "") + body + (end < text.length ? "…" : "");
 }
 
+/** What query_notes sees of a note: no content, only metadata the index already holds. */
+export interface QueryRecord {
+    path: string;
+    mtime: number;
+    tags: string[];
+    properties: Record<string, string | string[]>;
+}
+
 export interface AttachmentEntry {
     size: number;
     mtime: number;
@@ -84,6 +92,8 @@ export class SearchIndex {
     private content = new Map<string, string>();
     /** Frontmatter `title:` per path, when present — searched together with the path. */
     private titles = new Map<string, string>();
+    /** Frontmatter properties per path (lists kept as lists), for query_notes. */
+    private properties = new Map<string, Record<string, string | string[]>>();
     /**
      * Hash of the text each note's tags, links and title were parsed from.
      * Persisted, so the startup rebuild skips parsing notes that haven't changed.
@@ -128,11 +138,14 @@ export class SearchIndex {
                     this.backlinks.get(key)!.add(path);
                 }
             }
-            // Hashes and titles from another parser version are dropped, so
+            // Hashes, titles and properties from another parser version are dropped, so
             // those notes are parsed again by the startup rebuild.
             if (data.parser === PARSER_VERSION) {
                 for (const [path, h] of Object.entries(data.hashes ?? {})) this.hashes.set(path, h as string);
                 for (const [path, t] of Object.entries(data.titles ?? {})) this.titles.set(path, t as string);
+                for (const [path, p] of Object.entries(data.properties ?? {})) {
+                    this.properties.set(path, p as Record<string, string | string[]>);
+                }
             }
             for (const [path, v] of Object.entries(data.attachments ?? {})) {
                 const [size, mtime] = v as [number, number];
@@ -159,6 +172,7 @@ export class SearchIndex {
                 parser: PARSER_VERSION,
                 hashes: Object.fromEntries(this.hashes),
                 titles: Object.fromEntries(this.titles),
+                properties: Object.fromEntries(this.properties),
                 attachments: Object.fromEntries([...this.attachments].map(([p, a]) => [p, [a.size, a.mtime]])),
                 since: this._since,
             });
@@ -208,6 +222,11 @@ export class SearchIndex {
         } else {
             this.titles.delete(path);
         }
+        if (Object.keys(parsed.properties).length > 0) {
+            this.properties.set(path, parsed.properties);
+        } else {
+            this.properties.delete(path);
+        }
         if (parsed.tags.length > 0) {
             this.tags.set(path, parsed.tags);
         } else {
@@ -235,6 +254,7 @@ export class SearchIndex {
             this.tags.delete(path);
             this.content.delete(path);
             this.titles.delete(path);
+            this.properties.delete(path);
             this.hashes.delete(path);
             this.clearBacklinks(path);
         }
@@ -332,6 +352,16 @@ export class SearchIndex {
             .filter((p) => !prefix || p.startsWith(prefix))
             .map((p) => ({ path: p, mtime: this.mtimes.get(p) ?? 0 }));
         return entries.sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    /**
+     * Every indexed note with what query_notes filters on, sorted by path.
+     * `folder` is a prefix as in listWithMtime; `tag` must be one of the note's tags.
+     */
+    queryRecords(folder?: string, tag?: string): QueryRecord[] {
+        return this.listWithMtime(folder)
+            .filter((n) => !tag || this.getTags(n.path).includes(tag))
+            .map((n) => ({ ...n, tags: this.getTags(n.path), properties: this.properties.get(n.path) ?? {} }));
     }
 
     /** Get mtime for a path. */
