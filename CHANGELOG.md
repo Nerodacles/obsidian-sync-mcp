@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **`rename_note` renames a note and updates the links to it.** It moves the note like `move_note`, then rewrites the wikilinks, embeds and markdown links that resolve to the old path in every note that links to it (found through the backlink index), keeping labels, headings, block references and each link's style; links in code are left alone. The old name is added to the note's frontmatter `aliases` unless `keep_alias=false`, and `update_links=false` skips the rewriting. Needs `delete` at the source, `create` at the destination and `update` on each linking note; a linking note it may not update is listed and left as it was. Not atomic: the answer lists every note it rewrote or could not.
+
 ## 0.13.0
 
 ### Features
