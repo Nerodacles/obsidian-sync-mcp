@@ -156,6 +156,7 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 | `search_notes` | index (in-memory text, catch-up first) | — |
 | `get_note_metadata` | vault + index (backlinks) | — |
 | `move_note` | vault | vault + index |
+| `rename_note` | vault + index (backlinks) | vault + index (the note, then each linking note) |
 | `delete_note` | — | vault + index |
 
 ## Build (`tsup.config.ts`)
