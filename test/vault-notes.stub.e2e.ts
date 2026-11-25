@@ -19,7 +19,7 @@ import { NoteExistsError, NoteNotFoundError } from "../src/vault-backend.js";
 // that name, so load it at run time instead.
 const { describe, it } = createRequire(import.meta.url)("node:test") as typeof import("node:test");
 
-type Doc = { path: string; data: string[]; ctime: number; mtime: number; size: number };
+type Doc = { path: string; data: string[]; ctime: number; mtime: number; size: number; _rev?: string };
 
 /**
  * Enough of DirectFileManipulator for the note methods. Ids are lowercased like
@@ -28,6 +28,8 @@ type Doc = { path: string; data: string[]; ctime: number; mtime: number; size: n
  */
 function stubVault({ caseSensitive = false } = {}) {
     const docs = new Map<string, Doc>();
+    let revs = 0;
+    const nextRev = () => `${++revs}-stub`;
     const calls: string[] = [];
     const tick = () => new Promise((r) => setTimeout(r, 1));
     const id = (p: string) => (caseSensitive ? p : p.toLowerCase());
@@ -43,7 +45,7 @@ function stubVault({ caseSensitive = false } = {}) {
             calls.push(`put ${p}`);
             const text = await blob.text();
             await tick();
-            docs.set(id(p), { path: p, data: [text], ...info });
+            docs.set(id(p), { path: p, data: [text], ...info, _rev: nextRev() });
             return true;
         },
         delete: async (p: string) => {
@@ -51,11 +53,42 @@ function stubVault({ caseSensitive = false } = {}) {
             await tick();
             return docs.delete(id(p));
         },
+        // The revision-checked write path: a put refused unless the base matches, as CouchDB does.
+        liveSyncLocalDB: {
+            localDatabase: {
+                get: async (docId: string) => {
+                    await tick();
+                    const d = docs.get(docId);
+                    if (!d) throw Object.assign(new Error("missing"), { status: 404 });
+                    return { ...d };
+                },
+            },
+            getDBEntryMeta: async (p: string) => {
+                await tick();
+                const d = docs.get(id(p));
+                return d ? { ...d } : false;
+            },
+            putDBEntryWithLiveBaseRevision: async (doc: any, base: string | undefined) => {
+                calls.push(`put ${doc.path}`);
+                const text = await doc.data.text();
+                await tick();
+                if (docs.get(doc._id)?._rev !== base) return false;
+                const rev = nextRev();
+                docs.set(doc._id, { path: doc.path, data: [text], ctime: doc.ctime, mtime: doc.mtime, size: doc.size, _rev: rev });
+                return { ok: true, id: doc._id, rev };
+            },
+        },
     };
     const vault = new Vault({ couchdbUrl: "http://stub", couchdbUser: "u", couchdbPassword: "p", database: "stub" });
     (vault as any).manipulator = manipulator;
-    const seed = (p: string, text: string, ctime = 1) => docs.set(id(p), { path: p, data: [text], ctime, mtime: ctime, size: text.length });
-    return { vault, docs, calls, seed };
+    const seed = (p: string, text: string, ctime = 1) => docs.set(id(p), { path: p, data: [text], ctime, mtime: ctime, size: text.length, _rev: nextRev() });
+    // A second server instance on the same database: same documents, its own lock.
+    const otherInstance = () => {
+        const v = new Vault({ couchdbUrl: "http://stub", couchdbUser: "u", couchdbPassword: "p", database: "stub" });
+        (v as any).manipulator = manipulator;
+        return v;
+    };
+    return { vault, docs, calls, seed, otherInstance };
 }
 
 describe("Vault.writeNote modes (stubbed manipulator)", () => {
@@ -73,6 +106,16 @@ describe("Vault.writeNote modes (stubbed manipulator)", () => {
         seed("Raw/a.md", "v1");
         await assert.rejects(() => vault.writeNote("Raw/a.md", "v2", { mode: "create" }), (e: any) => e instanceof NoteExistsError && e.path === "Raw/a.md");
         assert.ok(!calls.some((c) => c.startsWith("put")), calls.join(", "));
+    });
+
+    it("create holds across two instances that don't share a lock", async () => {
+        const { vault, docs, otherInstance } = stubVault();
+        const other = otherInstance();
+        const results = await Promise.allSettled([vault.writeNote("Raw/n.md", "a", { mode: "create" }), other.writeNote("Raw/n.md", "b", { mode: "create" })]);
+        assert.deepEqual(results.map((r) => r.status).sort(), ["fulfilled", "rejected"]);
+        const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+        assert.ok(rejected.reason instanceof NoteExistsError, String(rejected.reason));
+        assert.equal(docs.get("raw/n.md")?.data.join(""), results[0].status === "fulfilled" ? "a" : "b");
     });
 
     it("create sees a case variant as the same note on a case-insensitive vault", async () => {

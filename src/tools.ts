@@ -143,8 +143,13 @@ export function registerTools(
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
             content: z.string().describe("Full markdown content for the note"),
             expected_revision: expectedRevisionParam,
+            create_only: z
+                .boolean()
+                .optional()
+                .describe("Only create: if a note already exists at the path, write nothing and say so. Default false (create or replace)."),
         }),
-        execute: async ({ path, content, expected_revision }) => {
+        execute: async ({ path, content, expected_revision, create_only }) => {
+            if (expected_revision !== undefined && create_only) return "expected_revision names an existing note, so it can't be combined with create_only. Nothing was written.";
             if (expected_revision !== undefined) {
                 // A revision names an existing note, so this is an update.
                 const denied = checkWrite(path, "update", writeFolders);
@@ -165,7 +170,8 @@ export function registerTools(
             // step as the write.
             const allow = allowedActions(path, writeFolders);
             const canCreate = allow.has("create");
-            const canUpdate = allow.has("update");
+            const canUpdate = allow.has("update") && !create_only;
+            if (create_only && !canCreate) return checkWrite(path, "create", writeFolders)!;
             if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders)!;
             const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
             let ok: boolean;
@@ -173,6 +179,7 @@ export function registerTools(
                 ok = await vault.writeNote(path, content, { mode });
             } catch (err) {
                 if (err instanceof NoteExistsError) {
+                    if (create_only) return `Note already exists: ${path}. Nothing was written (create_only); choose a new path.`;
                     return `${checkWrite(path, "update", writeFolders)} The note already exists; choose a new path.`;
                 }
                 if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders)!;
