@@ -26,6 +26,16 @@ status: draft
         assert.deepEqual(parseFrontmatterAndLinks("No frontmatter").aliases, []);
     });
 
+    it("keeps plain lists as lists in properties, for query_notes", () => {
+        const result = parseFrontmatterAndLinks("---\ntype: recipe\naliases:\n  - Winter soup\n  - Broth\nempty: []\nnested:\n  a: 1\n---\nBody");
+        assert.deepEqual(result.properties, { type: "recipe", aliases: ["Winter soup", "Broth"], nested: "a: 1" });
+        assert.equal(result.frontmatter.aliases, "Winter soup, Broth", "frontmatter still shows the list joined");
+        assert.deepEqual(parseFrontmatterAndLinks("---\n: [\n---\n").properties, {}, "invalid YAML has no properties");
+        const proto = parseFrontmatterAndLinks("---\n__proto__: [a, b]\n---\n").properties;
+        assert.deepEqual(Object.keys(proto), ["__proto__"], "__proto__ is an own property");
+        assert.equal(Object.getPrototypeOf(proto), Object.prototype, "and not the prototype");
+    });
+
     it("parses frontmatter tags", () => {
         const content = `---
 tags: [project, active, important]

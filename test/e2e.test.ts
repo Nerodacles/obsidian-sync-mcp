@@ -293,6 +293,19 @@ describe("E2E: list_tags", () => {
     });
 });
 
+describe("E2E: query_notes", () => {
+    it("filters by frontmatter and states the total", async () => {
+        const text = await callTool("query_notes", { where: [{ field: "title", op: "eq", value: "Welcome" }], select: ["title", "tags"] });
+        const lines = text.split("\n");
+        assert.equal(lines[0], "1 note matches; showing 1-1.");
+        assert.match(lines[1], /^- \[Welcome\.md\]\(obsidian:\/\/[^)]+\) · title: Welcome · tags: intro$/);
+        const json = JSON.parse(await callTool("query_notes", { format: "json", limit: 1 }));
+        assert.equal(json.shown, 1);
+        assert.ok(json.total >= 3, `total ${json.total}`);
+        assert.equal(typeof json.next_cursor, "string");
+    });
+});
+
 describe("E2E: get_note_metadata", () => {
     it("returns frontmatter and tags", async () => {
         const text = await callTool("get_note_metadata", { path: "Welcome.md" });
@@ -606,7 +619,7 @@ describe("E2E: READ_ONLY mode", () => {
         for (const w of ["write_note", "edit_note", "delete_note", "move_note", "rename_note"]) {
             assert.ok(!tools.includes(w), `${w} should not be registered in READ_ONLY mode`);
         }
-        for (const r of ["read_note", "list_notes", "list_folders", "list_tags", "get_note_metadata"]) {
+        for (const r of ["read_note", "list_notes", "list_folders", "list_tags", "query_notes", "get_note_metadata"]) {
             assert.ok(tools.includes(r), `${r} should remain available in READ_ONLY mode`);
         }
 
