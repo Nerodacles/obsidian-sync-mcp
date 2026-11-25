@@ -5,7 +5,7 @@ import { watch, readFileSync, statSync } from "fs";
 import { stat } from "fs/promises";
 import { setGlobalLogFunction, LEVEL_INFO } from "octagonal-wheels/common/logger";
 import { mountPasswordAuth, safeEqual } from "./auth.js";
-import { SearchIndex } from "./search.js";
+import { SearchIndex, parseSearchExclude } from "./search.js";
 import { applyIndexChange, pruneGhosts } from "./index-sync.js";
 import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.js";
 import { readOnlyVault } from "./vault-readonly.js";
@@ -47,6 +47,8 @@ const PORT = parseInt(process.env.PORT ?? "8787");
 const BASE_URL = process.env.BASE_URL ?? `http://localhost:${PORT}`;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const READ_ONLY = process.env.READ_ONLY === "true";
+const SEARCH_DEFAULT_EXCLUDE = parseSearchExclude(process.env.SEARCH_DEFAULT_EXCLUDE);
+if (SEARCH_DEFAULT_EXCLUDE.length > 0) console.log(`SEARCH_DEFAULT_EXCLUDE: search_notes leaves out ${SEARCH_DEFAULT_EXCLUDE.join(", ")} unless asked.`);
 let WRITE_FOLDERS: WriteScope;
 try {
     WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
@@ -483,7 +485,7 @@ if (AUTH_TOKEN) {
 }
 
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined);
+registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined, SEARCH_DEFAULT_EXCLUDE);
 
 if (ATTACHMENTS_ENABLED) {
     const uploadRegistry = new UploadRegistry({ ttlMs: ATTACHMENT_UPLOAD_TTL_SECONDS * 1000 });

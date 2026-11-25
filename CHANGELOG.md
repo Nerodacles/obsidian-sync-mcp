@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **`search_notes` matches words, not substrings.** A term with several words matches a note that contains all of them in any order (`garden plan` finds "the plan for the garden"), words match whole (`ups` no longer finds "backups"), and a hyphen and a space between words are the same (`site-loss` == `site loss`). See [search matching](README.md#search-matching).
+- Frontmatter `aliases` and the `summary` and `case` properties are searched together with the path and title, so their hits rank above plain text hits.
+- `SEARCH_DEFAULT_EXCLUDE` (comma-separated folders) leaves those folders out of `search_notes` unless `folder` points inside one. The status line says which folders were left out and how many matching notes they held. Unset keeps today's behaviour.
+
+### Breaking changes
+- `search_notes` no longer matches part of a word: `backup` does not find "backups", and `drag kanban` finds notes with both words anywhere, not only the phrase. A term made only of hyphens and spaces (`---`) matches nothing. A query with more than 100 distinct words is refused.
+
+### Performance
+- The first start after upgrading parses every note once, to index aliases and the summary and case properties.
+
 ## 0.14.0
 
 ### Features
