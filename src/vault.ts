@@ -4,8 +4,8 @@
 
 import { DirectFileManipulator } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
 import type { DirectFileManipulatorOptions } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
-import { createTextBlob, createBinaryBlob, readContent } from "../lib/livesync-commonlib/src/common/utils.ts";
-import type { LoadedEntry } from "../lib/livesync-commonlib/src/common/types.ts";
+import { createTextBlob, createBinaryBlob, readContent, determineTypeFromBlob } from "../lib/livesync-commonlib/src/common/utils.ts";
+import type { LoadedEntry, SavingEntry, DocumentID } from "../lib/livesync-commonlib/src/common/types.ts";
 import type { FilePathWithPrefix } from "../lib/livesync-commonlib/src/common/types.ts";
 import type { MetaEntry } from "../lib/livesync-commonlib/src/API/DirectFileManipulatorV2.ts";
 import { isPathProbablyObfuscated, decrypt } from "octagonal-wheels/encryption/encryption";
@@ -400,15 +400,16 @@ export class Vault implements VaultBackend {
     }
 
     /**
-     * As with attachments, the library's put can't be made conditional, so the
-     * create/update checks rely on the caller holding the document's lock. That
-     * covers writes made by this server; a concurrent write from Obsidian is
-     * left to LiveSync's conflict handling.
+     * "create" is checked by CouchDB itself (see createNoteUnlocked), so it holds
+     * across server instances sharing a database. "update" relies on the caller
+     * holding the document's lock, which covers writes made by this server; a
+     * concurrent write from Obsidian is left to LiveSync's conflict handling.
      */
     private async writeNoteUnlocked(path: string, content: string, { mode = "upsert" }: NoteWriteOptions): Promise<boolean> {
         // Clear cached PBKDF2 salt so we re-fetch from CouchDB before encrypting.
         // Prevents stale salt after Obsidian "Overwrite remote" rebuilds (issue #686).
         clearHandlers();
+        if (mode === "create") return await this.createNoteUnlocked(path, content);
 
         // Preserve ctime if note already exists
         let ctime = Date.now();
@@ -425,6 +426,63 @@ export class Vault implements VaultBackend {
             mtime: Date.now(),
             size: new TextEncoder().encode(content).byteLength,
         });
+    }
+
+    /**
+     * Create a note only if none exists, in one CouchDB request, so it holds
+     * across server instances: a put without a base revision, which CouchDB
+     * refuses (409) while a live document is there and accepts on top of a
+     * CouchDB deletion. A note deleted through LiveSync is a live document
+     * marked `deleted`; it is created again as a child of that revision, which
+     * CouchDB likewise refuses if someone else got there first.
+     */
+    private async createNoteUnlocked(path: string, content: string): Promise<boolean> {
+        const id = await this.manipulator.path2id(path as FilePathWithPrefix);
+        const base = await this.softDeletedRevision(path, id);
+        if (await this.putAtRevision(path, id, content, Date.now(), base)) return true;
+        // The library answers false both for a 409 and for a write it could not
+        // store at all; only the document's current state tells the two apart.
+        const now = await this.manipulator.liveSyncLocalDB.getDBEntryMeta(path as FilePathWithPrefix, undefined, true);
+        if (now && now._rev !== base) throw new NoteExistsError(path);
+        throw new Error(`CouchDB did not store the new note ${path}`);
+    }
+
+    /** undefined: no live document. A revision: a document LiveSync marked deleted. Throws NoteExistsError for a live note. */
+    private async softDeletedRevision(path: string, id: DocumentID): Promise<string | undefined> {
+        let doc: { _rev: string; deleted?: boolean };
+        try {
+            doc = await this.manipulator.liveSyncLocalDB.localDatabase.get(id);
+        } catch (err) {
+            if ((err as { status?: number })?.status === 404) return undefined;
+            throw err;
+        }
+        if (doc.deleted) return doc._rev;
+        throw new NoteExistsError(path);
+    }
+
+    /**
+     * Write a note as a child of `baseRevision` (none: a new document) with a
+     * plain, non-forced put, so CouchDB refuses it when the document has moved
+     * on. Returns the new revision, or false when the write was refused.
+     */
+    private async putAtRevision(path: string, id: DocumentID, content: string, ctime: number, baseRevision: string | undefined): Promise<string | false> {
+        const data = createTextBlob(content);
+        const type = determineTypeFromBlob(data);
+        const doc = {
+            _id: id,
+            path: path as FilePathWithPrefix,
+            data,
+            ctime,
+            mtime: Date.now(),
+            size: new TextEncoder().encode(content).byteLength,
+            type,
+            datatype: type,
+            eden: {},
+            children: [] as string[],
+        } as SavingEntry;
+        // Without a base revision the put carries no _rev, which CouchDB accepts only for a new document.
+        const result = await this.manipulator.liveSyncLocalDB.putDBEntryWithLiveBaseRevision(doc, baseRevision as string);
+        return result ? result.rev : false;
     }
 
     async deleteNote(path: string): Promise<boolean> {

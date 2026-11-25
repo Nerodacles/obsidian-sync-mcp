@@ -202,7 +202,7 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | Tool | Description |
 |---|---|
 | `read_note` | Read a note's markdown content by path |
-| `write_note` | Create or overwrite a note (replaces entire content) |
+| `write_note` | Create or overwrite a note (replaces entire content); `create_only: true` refuses to replace an existing note |
 | `edit_note` | Edit a note without rewriting it — append, prepend (after frontmatter), or replace exact text |
 | `list_folders` | List all folders in the vault with note counts — use to discover folder names |
 | `list_tags` | List all tags in the vault with counts — use to discover tags before filtering |

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **`write_note` takes `create_only`.** With `create_only: true` the write only creates: if a note already exists at the path, nothing is written and the answer says so. Useful for agents that pick a file name and must not clobber someone else's note.
+
+### Fixes
+- CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
+
 ## 0.13.0
 
 ### Features

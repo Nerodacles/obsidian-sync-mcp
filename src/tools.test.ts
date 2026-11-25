@@ -399,6 +399,31 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
         assert.equal(await vault.readNote("Raw/a.md"), "someone else");
     });
 
+    it("create_only: write_note refuses an existing note even where updates are allowed", async () => {
+        const { vault, call } = await setup("MCP");
+        assert.match(await call("write_note", { path: "MCP/a.md", content: "v1", create_only: true }), /^Note saved: MCP\/a.md/);
+        assert.equal(await call("write_note", { path: "MCP/a.md", content: "v2", create_only: true }),
+            "Note already exists: MCP/a.md. Nothing was written (create_only); choose a new path.");
+        assert.equal(await vault.readNote("MCP/a.md"), "v1");
+        // Without it, write_note still replaces.
+        assert.match(await call("write_note", { path: "MCP/a.md", content: "v3" }), /^Note saved/);
+        assert.equal(await vault.readNote("MCP/a.md"), "v3");
+    });
+
+    it("create_only passes mode create, and needs create permission", async () => {
+        for (const scope of ["MCP", "MCP:create", "MCP:create+update"]) {
+            const { vault, call } = await setup(scope);
+            const seen: unknown[] = [];
+            const writeNote = vault.writeNote.bind(vault);
+            vault.writeNote = async (p: string, c: string, o?: any) => { seen.push(o?.mode); return writeNote(p, c, o); };
+            await call("write_note", { path: "MCP/n.md", content: "y", create_only: true });
+            assert.deepEqual(seen, ["create"], scope);
+        }
+        const { vault, call } = await setup("MCP:update");
+        assert.match(await call("write_note", { path: "MCP/n.md", content: "y", create_only: true }), /can't be created|allows only update/);
+        assert.equal(await vault.readNote("MCP/n.md"), null);
+    });
+
     it("write_note passes the mode the folder allows down to the backend", async () => {
         const cases: [string, string | undefined][] = [["MCP", "upsert"], ["MCP:create+update", "upsert"], ["MCP:create", "create"], ["MCP:update", "update"], ["MCP:create+delete", "create"], ["MCP:update+delete", "update"]];
         for (const [scope, mode] of cases) {
