@@ -13,10 +13,15 @@ import { SUPPORTED_ATTACHMENT_EXTENSIONS, isValidAttachmentPath } from "./attach
  * attachment extensions are part of it because they decide which link targets
  * count.
  */
-export const PARSER_VERSION = `4:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
+export const PARSER_VERSION = `5:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
 
 export interface NoteMetadata {
     frontmatter: Record<string, string>;
+    /**
+     * The same properties as `frontmatter`, for query_notes: a list of plain
+     * values stays a list instead of being joined with ", ".
+     */
+    properties: Record<string, string | string[]>;
     tags: string[];
     links: string[];
     /** Why the frontmatter was ignored, when it isn't valid YAML. */
@@ -73,7 +78,7 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
     const yaml = fm?.[1] ?? "";
     const body = fm ? content.slice(fm[0].length) : content;
 
-    const { frontmatter, tags: yamlTags, error } = readFrontmatter(yaml);
+    const { frontmatter, properties, tags: yamlTags, error } = readFrontmatter(yaml);
     const { text, links } = readBody(body);
     const tags = new Set(yamlTags);
     // Wikilinks in properties (related: "[[Note]]") count too.
@@ -84,7 +89,7 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
     for (const match of text.matchAll(TAG)) {
         if (!/^\p{Nd}+$/u.test(match[2])) tags.add(match[2]);
     }
-    const metadata: NoteMetadata = { frontmatter, tags: [...tags], links: [...new Set(links)] };
+    const metadata: NoteMetadata = { frontmatter, properties, tags: [...tags], links: [...new Set(links)] };
     if (error) metadata.frontmatterError = error;
     return metadata;
 }
@@ -96,14 +101,20 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
  * or a string of comma- or line-separated tags. Frontmatter that isn't valid
  * YAML is ignored, as Obsidian does.
  */
-function readFrontmatter(yaml: string): { frontmatter: Record<string, string>; tags: string[]; error?: string } {
+function readFrontmatter(yaml: string): {
+    frontmatter: Record<string, string>;
+    properties: Record<string, string | string[]>;
+    tags: string[];
+    error?: string;
+} {
     const frontmatter: Record<string, string> = {};
+    const properties: Record<string, string | string[]> = {};
     const tags: string[] = [];
     const doc = parseDocument(yaml, { schema: "failsafe", uniqueKeys: false });
     // The first line of yaml's message, without the snippet it introduces:
     // "Invalid escape sequence \Users\me" at line 1, column 10".
-    if (doc.errors.length > 0) return { frontmatter, tags, error: doc.errors[0].message.split("\n")[0].replace(/:$/, "") };
-    if (!isMap(doc.contents)) return { frontmatter, tags };
+    if (doc.errors.length > 0) return { frontmatter, properties, tags, error: doc.errors[0].message.split("\n")[0].replace(/:$/, "") };
+    if (!isMap(doc.contents)) return { frontmatter, properties, tags };
 
     const resolve = aliasResolver(doc);
     for (const pair of doc.contents.items) {
@@ -111,12 +122,21 @@ function readFrontmatter(yaml: string): { frontmatter: Record<string, string>; t
         if (!isScalar(key)) continue;
         const value = resolve(pair.value);
         const shown = showValue(value, resolve, yaml);
-        if (shown) frontmatter[String(key.value)] = shown;
+        if (shown) {
+            frontmatter[String(key.value)] = shown;
+            // defineProperty, so a key named __proto__ is a property and not the object's prototype.
+            Object.defineProperty(properties, String(key.value), {
+                value: isSeq(value) && value.items.every((item) => isScalar(resolve(item))) ? scalars(value, resolve) : shown,
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+        }
         if (key.value !== "tags") continue;
         const raw = isScalar(value) ? String(value.value).split(/[,\n]/) : isSeq(value) ? scalars(value, resolve) : [];
         for (const tag of raw) if (tag.trim()) tags.push(tag.trim());
     }
-    return { frontmatter, tags };
+    return { frontmatter, properties, tags };
 }
 
 type Resolve = (node: unknown) => unknown;
