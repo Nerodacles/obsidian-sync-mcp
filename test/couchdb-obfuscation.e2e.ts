@@ -53,7 +53,7 @@ async function rawAllDocIds(db: string): Promise<string[]> {
 }
 
 // Reset databases so the harness is idempotent across runs.
-for (const db of ["obfvault", "plainvault", "keyedvault", "casevault", "watchervault", "attachvault", "movevault", "nfcvault", "freshnfc", "freshlegacy", "internalvault", "notemodevault", "revisionvault"]) {
+for (const db of ["obfvault", "plainvault", "keyedvault", "casevault", "watchervault", "attachvault", "movevault", "nfcvault", "freshnfc", "freshlegacy", "internalvault", "notemodevault", "revisionvault", "createonlyvault"]) {
     await fetch(`${base.couchdbUrl}/${db}`, { method: "DELETE", headers: auth });
     const res = await fetch(`${base.couchdbUrl}/${db}`, { method: "PUT", headers: auth });
     if (!res.ok) throw new Error(`could not create ${db}: ${res.status}`);
@@ -467,6 +467,41 @@ step("Notes: create/update modes, concurrent creates, moves never replace");
     assert.equal(await v.readNote(oneWon ? "C/two.md" : "C/one.md"), oneWon ? "two" : "one", "the other source is kept");
     await v.close();
     console.log("create/update modes, deleted notes, concurrent creates and no-replace moves OK");
+}
+
+step("Notes: create-only across two instances on one database");
+{
+    // Two servers on one database don't share a lock, so only CouchDB can make
+    // "create unless it exists" one step.
+    const cfg = { ...base, database: "createonlyvault", passphrase, obfuscatePaths: true };
+    const a = new Vault(cfg);
+    await a.init();
+    const b = new Vault(cfg);
+    await b.init();
+    for (let round = 0; round < 10; round++) {
+        const path = `Inbox/race-${round}.md`;
+        const results = await Promise.allSettled([
+            a.writeNote(path, "from a", { mode: "create" }),
+            b.writeNote(path, "from b", { mode: "create" }),
+        ]);
+        const won = results.filter((r) => r.status === "fulfilled" && r.value === true).length;
+        assert.equal(won, 1, `round ${round}: exactly one create wins across instances, got ${JSON.stringify(results.map((r) => r.status === "fulfilled" ? r.value : String(r.reason)))}`);
+        for (const r of results) if (r.status === "rejected") assert.ok(r.reason instanceof NoteExistsError, String(r.reason));
+        const winner = results[0].status === "fulfilled" ? "from a" : "from b";
+        assert.equal(await a.readNote(path), winner);
+        assert.equal(await b.readNote(path), winner);
+    }
+    // An existing note written by the other instance is refused too, and kept.
+    assert.equal(await a.writeNote("Inbox/kept.md", "first", { mode: "create" }), true);
+    await assert.rejects(() => b.writeNote("Inbox/kept.md", "second", { mode: "create" }), NoteExistsError);
+    assert.equal(await a.readNote("Inbox/kept.md"), "first");
+    // A deleted note (LiveSync keeps it as a document marked deleted) can be created again, once.
+    assert.equal(await a.deleteNote("Inbox/kept.md"), true);
+    const again = await Promise.allSettled([a.writeNote("Inbox/kept.md", "again a", { mode: "create" }), b.writeNote("Inbox/kept.md", "again b", { mode: "create" })]);
+    assert.equal(again.filter((r) => r.status === "fulfilled").length, 1, "one re-create wins");
+    await a.close();
+    await b.close();
+    console.log("create-only holds across two instances, deleted notes can be created again once");
 }
 
 step("NFC path identity: vault declared nfc-path-identity-v1 (LiveSync 1.0.49+ default) is detected");
