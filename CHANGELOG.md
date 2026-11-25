@@ -11,11 +11,13 @@
 - Frontmatter `aliases` and the `summary` and `case` properties are searched together with the path and title, so their hits rank above plain text hits.
 - `SEARCH_DEFAULT_EXCLUDE` (comma-separated folders) leaves those folders out of `search_notes` unless `folder` points inside one. The status line says which folders were left out and how many matching notes they held. Unset keeps today's behaviour.
 - `read_note` on a path that doesn't exist still answers `Note not found: <path>`, and now adds the notes whose file name or frontmatter `aliases` match the requested name, e.g. `Did you mean:` / `- Projects/Garden plan.md (alias "Veg patch")`.
+- **Sync conflicts are visible and can be resolved (CouchDB mode).** When an Obsidian edit and an agent edit leave a note with two live versions in CouchDB, reads used to show only the one CouchDB picked, so agents never saw the other. `read_note` and `get_note_metadata` now start with `CONFLICT: N other live version(s) of this note; see get_conflict.` on such notes (answers for other notes are unchanged). New tools: `list_conflicts` lists conflicted notes without reading their text, `get_conflict` shows each other version as a line diff against the winner (bounded to 30,000 characters, full text on request), and `resolve_conflict` keeps one version or writes merged text and deletes the others, refusing if the versions changed since `get_conflict`. Local mode answers that conflicts need CouchDB mode.
 
 ### Fixes
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
 
 ### Tests
+- `npm run test:conflicts`: makes real conflicts (an earlier body inserted with `new_edits=false` as a sibling of the current revision) on a plain and an E2EE+obfuscated database, then checks the CONFLICT line, the listing, the diff, a refused stale resolve, and three resolutions read back from CouchDB with no `_conflicts` left.
 - `npm run test:concurrency`: concurrent `edit_note` calls through two server instances on one throwaway CouchDB database, read back straight from CouchDB with conflict revisions; `--load 4x50` measures lost edits and latency.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 

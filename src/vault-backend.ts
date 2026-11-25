@@ -7,12 +7,79 @@ export interface NoteInfo extends NoteMetadata {
     mtime: number;
     /** CouchDB mode: the note's current revision (`_rev`), opaque. Undefined in local mode. */
     revision?: string;
+    /** CouchDB mode: revisions of the other live leaves (`_conflicts`), from the same fetch. */
+    conflicts?: string[];
 }
 
 /** A note read together with the revision it was read at. */
 export interface RevisedNote {
     content: string;
     revision: string;
+    /** CouchDB mode: revisions of the other live leaves (`_conflicts`), from the same fetch. */
+    conflicts?: string[];
+}
+
+/** A note that has more than one live revision leaf. */
+export interface ConflictSummary {
+    path: string;
+    /** The revision CouchDB picked as the winner: the one every read shows. */
+    revision: string;
+    /** The other live leaves. */
+    conflicts: string[];
+}
+
+export interface ConflictListing {
+    conflicts: ConflictSummary[];
+    /** Conflicted documents left out because their path could not be decrypted. */
+    unreadable: number;
+}
+
+/** One live leaf of a conflicted note. */
+export interface ConflictLeaf {
+    revision: string;
+    /** The leaf's text; null when its chunks could not be read. */
+    content: string | null;
+    mtime: number;
+    size: number;
+    /** A LiveSync deletion (`deleted: true`), which is still a live leaf in CouchDB. */
+    deleted: boolean;
+}
+
+export interface ConflictDetail {
+    path: string;
+    winner: ConflictLeaf;
+    /** The other live leaves, in CouchDB's `_conflicts` order. Empty when the note has no conflict. */
+    others: ConflictLeaf[];
+}
+
+/** How to resolve a conflict: keep one leaf's text, or write merged text. */
+export type ConflictResolution = { keep: string } | { content: string };
+
+export interface ConflictResolved {
+    /** The note's revision after the resolution. */
+    revision: string;
+    /** The note's text after the resolution; null when only other leaves were removed and the text did not change. */
+    content: string | null;
+    /** Leaves removed. */
+    removed: string[];
+    /** Live leaves other than the winner still present when read back (another writer added or moved one). */
+    remaining: string[];
+}
+
+/** The leaf to keep can't be kept: it is a deletion, or its text can't be read. */
+export class ConflictLeafUnreadableError extends Error {
+    constructor(readonly path: string, readonly revision: string, readonly reason: string) {
+        super(`Version ${revision} of ${path} can't be kept: ${reason}`);
+        this.name = "ConflictLeafUnreadableError";
+    }
+}
+
+/** The leaves of a conflicted note are not the ones the caller saw. */
+export class ConflictChangedError extends Error {
+    constructor(readonly path: string, readonly expected: string[], readonly current: string[]) {
+        super(`The versions of ${path} changed: expected ${expected.join(",")}, now ${current.join(",") || "(none)"}`);
+        this.name = "ConflictChangedError";
+    }
 }
 
 export interface UpdateOptions {
@@ -145,6 +212,21 @@ export interface VaultBackend {
      * and nothing is written). Throws NoteNotFoundError when the note is absent.
      */
     updateNote?(path: string, apply: (content: string) => string, options?: UpdateOptions): Promise<UpdateResult>;
+    /**
+     * CouchDB mode only: notes with more than one live revision leaf, without
+     * loading any note body.
+     */
+    listConflicts?(folder?: string): Promise<ConflictListing>;
+    /** CouchDB mode only: the winner and every other live leaf with their text; null when the note is absent. */
+    getConflict?(path: string): Promise<ConflictDetail | null>;
+    /**
+     * CouchDB mode only: settle a conflict. Refuses with ConflictChangedError
+     * unless the note's live leaves are exactly `expectedLeaves`. `keep` names
+     * the leaf whose text survives; `content` is merged text. Either is written
+     * on top of the winner (no write when keeping the winner), then every other
+     * leaf is deleted at its own revision.
+     */
+    resolveConflict?(path: string, expectedLeaves: string[], resolution: ConflictResolution): Promise<ConflictResolved>;
     /** Never replaces a note at `to`: throws NoteExistsError instead, checked in the same step as the move. */
     moveNote(from: string, to: string): Promise<boolean>;
     getMetadata(path: string): Promise<NoteInfo | null>;
