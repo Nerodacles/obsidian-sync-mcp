@@ -6,7 +6,8 @@ import { join } from "path";
 import { LocalVault } from "./vault-local.js";
 import { SearchIndex } from "./search.js";
 import { parseWriteFolders } from "./write-scope.js";
-import { registerTools, READ_NOTE_MAX_RESULT_SIZE_CHARS, SEARCH_MAX_TERMS, SEARCH_MAX_TERM_LENGTH, cleanSearchTerms, EDIT_MAX_ATTEMPTS, NO_REVISIONS_MESSAGE } from "./tools.js";
+import { registerTools, READ_NOTE_MAX_RESULT_SIZE_CHARS, SEARCH_MAX_TERMS, SEARCH_MAX_TERM_LENGTH, cleanSearchTerms, EDIT_MAX_ATTEMPTS, NO_REVISIONS_MESSAGE, NO_OP_STORE_MESSAGE } from "./tools.js";
+import { MemoryOpStore, fingerprint } from "./op-store.js";
 import { RevisionMismatchError, UpdateRetriesExhaustedError } from "./vault-backend.js";
 
 function captureTools(): { name: string; _meta?: Record<string, unknown> }[] {
@@ -555,5 +556,75 @@ describe("revisions (expected_revision)", () => {
         registerTools({ addTool: (t: any) => tools.push(t) } as any, revisedVault("v1") as any, new SearchIndex(), "vault", false, parseWriteFolders("Raw:create"));
         const tool = tools.find((t) => t.name === "write_note");
         assert.match(await tool.execute(tool.parameters.parse({ path: "Raw/a.md", content: "v2", expected_revision: "1-x" }), {}), /allows only create/);
+    });
+});
+
+describe("op_id (idempotent writes)", () => {
+    async function setup(opStore?: MemoryOpStore, readOnly = false) {
+        const root = await mkdtemp(join(tmpdir(), "tools-op-"));
+        const vault = new LocalVault(root);
+        await vault.writeNote("a.md", "start");
+        const tools: any[] = [];
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, vault, new SearchIndex(), "vault", readOnly, null, undefined, opStore);
+        const call = (name: string, args: any): Promise<string> => {
+            const tool = tools.find((t) => t.name === name);
+            return tool.execute(tool.parameters.parse(args), {});
+        };
+        return { vault, call, tools, cleanup: () => rm(root, { recursive: true, force: true }) };
+    }
+
+    it("a repeated op_id returns the first answer and writes once", async () => {
+        const { vault, call, cleanup } = await setup(new MemoryOpStore());
+        try {
+            const first = await call("edit_note", { path: "a.md", content: "line", op_id: "op-1" });
+            const again = await call("edit_note", { path: "a.md", content: "line", op_id: "op-1" });
+            assert.equal(again, first);
+            assert.equal(await vault.readNote("a.md"), "start\nline");
+            // Without op_id, behaviour is unchanged: each call writes.
+            await call("edit_note", { path: "a.md", content: "line" });
+            await call("edit_note", { path: "a.md", content: "line" });
+            assert.equal(await vault.readNote("a.md"), "start\nline\nline\nline");
+        } finally { await cleanup(); }
+    });
+
+    it("the same op_id with other arguments is refused", async () => {
+        const { vault, call, cleanup } = await setup(new MemoryOpStore());
+        try {
+            await call("edit_note", { path: "a.md", content: "one", op_id: "op-2" });
+            assert.match(await call("edit_note", { path: "a.md", content: "two", op_id: "op-2" }), /^op_id op-2 was already used for a different call/);
+            assert.match(await call("write_note", { path: "a.md", content: "one", op_id: "op-2" }), /^op_id op-2 was already used/);
+            assert.equal(await vault.readNote("a.md"), "start\none");
+        } finally { await cleanup(); }
+    });
+
+    it("a claimed but unfinished op_id answers 'outcome unknown' and writes nothing", async () => {
+        const store = new MemoryOpStore();
+        const { vault, call, cleanup } = await setup(store);
+        try {
+            await store.claim("op-3", fingerprint("edit_note", { path: "a.md", content: "x" }));
+            assert.match(await call("edit_note", { path: "a.md", content: "x", op_id: "op-3" }), /has not finished: .*outcome is unknown/);
+            assert.equal(await vault.readNote("a.md"), "start");
+        } finally { await cleanup(); }
+    });
+
+    it("without OPS_DATABASE an op_id is refused, not ignored", async () => {
+        const { vault, call, cleanup } = await setup(undefined);
+        try {
+            assert.equal(await call("edit_note", { path: "a.md", content: "x", op_id: "op-4" }), NO_OP_STORE_MESSAGE);
+            assert.equal(await vault.readNote("a.md"), "start");
+        } finally { await cleanup(); }
+    });
+
+    it("every write tool takes op_id; read tools don't; a malformed op_id fails the schema", async () => {
+        const { tools, cleanup } = await setup(new MemoryOpStore());
+        try {
+            for (const t of tools) {
+                const has = "op_id" in t.parameters.shape;
+                assert.equal(has, ["write_note", "edit_note", "delete_note", "move_note"].includes(t.name), t.name);
+            }
+            const edit = tools.find((t) => t.name === "edit_note");
+            assert.equal(edit.parameters.safeParse({ path: "a.md", content: "x", op_id: "has space" }).success, false);
+            assert.equal(edit.parameters.safeParse({ path: "a.md", content: "x", op_id: "x".repeat(129) }).success, false);
+        } finally { await cleanup(); }
     });
 });

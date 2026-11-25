@@ -5,12 +5,14 @@
 ### Features
 - **`write_note` takes `create_only`.** With `create_only: true` the write only creates: if a note already exists at the path, nothing is written and the answer says so. Useful for agents that pick a file name and must not clobber someone else's note.
 - **Concurrent edits no longer lose changes (CouchDB mode, #2).** `edit_note` writes only if the note is still at the revision it read, and otherwise re-reads and re-applies the edit (up to 10 times), so agents editing the same note at once, through one instance or several on the same database, all keep their changes. Before, every call answered "Note edited" while most of the edits were silently overwritten or left as hidden conflict revisions. `read_note` and `get_note_metadata` now show the note's revision, and `write_note` and `edit_note` take an optional `expected_revision` that refuses the write when the note has changed since. Local mode is unchanged and refuses `expected_revision`.
+- **`op_id` makes retried writes safe (opt-in, CouchDB mode).** Set `OPS_DATABASE` to a database name and the write tools accept an `op_id`: a call repeated with the same id (an agent retrying after a timeout) returns the first answer instead of appending or writing again. Records live in that separate database, so they work across server instances and restarts and are never synced to Obsidian. Without `OPS_DATABASE` nothing changes and `op_id` is refused.
 
 ### Fixes
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
 
 ### Tests
 - `npm run test:concurrency`: concurrent `edit_note` calls through two server instances on one throwaway CouchDB database, read back straight from CouchDB with conflict revisions; `--load 4x50` measures lost edits and latency.
+- `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 
 ## 0.13.0
 
