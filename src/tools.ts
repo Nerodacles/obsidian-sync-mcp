@@ -32,11 +32,14 @@ const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as c
 /**
  * edit_note rounds when another writer changes the note between its read and
  * its write (CouchDB mode): at least this many, and more until
- * EDIT_MIN_RETRY_MS has passed (at most 5 x this many). Measured with the
- * concurrency harness on two instances: a burst of 20 simultaneous edits all
- * land; writers looping flat out on one note, or 20 writers with up to 200 ms
- * between edits, saw about 1 refusal in 200. A refused edit answers "Failed
- * to edit note" and writes nothing; it is never silently dropped.
+ * EDIT_MIN_RETRY_MS has passed (at most 5 x this many). Edits queued on one
+ * server are written together (see CouchVault.updateNote), so rounds are lost
+ * only to other instances. Measured with the concurrency harness, two
+ * instances, 20 writers appending to one note with up to 100 ms between edits:
+ * all 400 land on a local CouchDB; where a round trip is slow and the note
+ * gets more edits than it can absorb, a few may still be refused. A refused
+ * edit answers "Failed to edit note" and writes nothing; it is never silently
+ * dropped.
  */
 export const EDIT_MAX_ATTEMPTS = 10;
 /** edit_note keeps retrying past EDIT_MAX_ATTEMPTS until this much time has passed (at most 5 x the attempts). */
