@@ -6,6 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
+import { addAlias, noteName, rewriteLinks } from "./rename.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -26,7 +27,7 @@ export function cleanSearchTerms(terms: string[] | undefined): string[] {
         .slice(0, SEARCH_MAX_TERMS);
 }
 
-const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as const;
+const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note", "rename_note"] as const;
 
 /**
  * edit_note rounds when another writer changes the note between its read and
@@ -533,6 +534,130 @@ export function registerTools(
         },
     });
 
+    if (!readOnly) server.addTool({
+        name: "rename_note",
+        description:
+            "Rename or move a note and update the links to it. Moves the note like move_note (never onto an existing note), then rewrites, in every note that links to it, the wikilinks, embeds and markdown links that point at the old path, keeping each link's label, heading, block reference and style; links in code are left alone. " +
+            "By default the old name is also added to the note's frontmatter `aliases`. " +
+            "Not atomic: the rename and each rewritten note are separate writes, and the answer lists every note it rewrote and every note it could not, with counts." + writeScopeNote,
+        parameters: z.object({
+            from: z.string().describe("Current path, e.g. 'Projects/Garden plan.md'"),
+            to: z.string().describe("New path, e.g. 'Projects/Garden/Spring planting.md'"),
+            update_links: z.boolean().optional().describe("Rewrite the links in other notes. Default true."),
+            keep_alias: z.boolean().optional().describe("Add the old name to the moved note's frontmatter aliases. Default true."),
+        }),
+        execute: async ({ from, to, update_links, keep_alias }) => {
+            // The note itself: the same checks as move_note.
+            const denied = checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders);
+            if (denied) return denied;
+            const content = await vault.readNote(from);
+            if (content === null) return `Note not found: ${from}`;
+            // Linkers are taken before the index forgets the old path. Backlinks
+            // are keyed by path and by name; the name with .md also catches a
+            // markdown link written as a bare file name.
+            const notesBefore = searchIndex.listPaths();
+            const linkers = update_links === false
+                ? []
+                : [...new Set([...searchIndex.getBacklinks(from), ...searchIndex.getBacklinks(noteName(from) + ".md")])]
+                    .filter((p) => p.toLowerCase() !== from.toLowerCase())
+                    .sort();
+            let ok: boolean;
+            try {
+                ok = await vault.moveNote(from, to);
+            } catch (err) {
+                if (err instanceof NoteExistsError) return `A note already exists at ${to}. Nothing was renamed or rewritten.`;
+                throw err;
+            }
+            if (!ok) return `Failed to move: ${from} → ${to}. Nothing was rewritten.`;
+            searchIndex.remove(from);
+            const lines = [`Renamed: ${from} → ${to}`];
+
+            // The moved note: its own links to itself, and the alias. Both
+            // count as part of creating it at the destination.
+            let moved = content;
+            let selfLinks = 0;
+            if (update_links !== false) {
+                const self = rewriteLinks(content, { from, to, notesBefore, sourceBefore: from, sourceAfter: to });
+                moved = self.content;
+                selfLinks = self.rewritten;
+            }
+            const oldName = noteName(from);
+            let aliasLine: string | null = null;
+            if (keep_alias !== false && oldName.toLowerCase() !== noteName(to).toLowerCase()) {
+                const alias = addAlias(moved, oldName);
+                if (alias.status === "added") {
+                    moved = alias.content;
+                    aliasLine = `Alias added to ${to}: ${oldName}`;
+                } else if (alias.status === "present") {
+                    aliasLine = `Alias already present in ${to}: ${oldName}`;
+                } else {
+                    aliasLine = `Alias not added to ${to}: its frontmatter isn't valid YAML (${alias.reason})`;
+                }
+            }
+            if (moved !== content && !(await vault.writeNote(to, moved, { mode: "update" }).catch(() => false))) {
+                aliasLine = `Not updated: ${to} (alias and links to itself), the write failed`;
+                selfLinks = 0;
+                moved = content;
+            }
+            // Indexed once: a second update in the same millisecond would be ignored.
+            searchIndex.update(to, moved, Date.now());
+            if (aliasLine) lines.push(aliasLine);
+            if (selfLinks > 0) lines.push(`Rewritten: ${to} (${plural(selfLinks, "link")} to itself)`);
+
+            let rewrittenNotes = 0;
+            let rewrittenLinks = 0;
+            let skipped = 0;
+            let unchanged = 0;
+            const details: string[] = [];
+            for (const path of linkers) {
+                try {
+                    const text = await vault.readNote(path);
+                    if (text === null) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path}, the note is gone`);
+                        continue;
+                    }
+                    const result = rewriteLinks(text, { from, to, notesBefore, sourceBefore: path, sourceAfter: path });
+                    const ambiguous = result.ambiguous > 0 ? `; ${plural(result.ambiguous, "link")} left as written, since several notes share that name` : "";
+                    if (result.rewritten === 0) {
+                        unchanged++;
+                        details.push(`- Unchanged: ${path}, no link in it needs rewriting${ambiguous}`);
+                        continue;
+                    }
+                    const refused = checkWrite(path, "update", writeFolders);
+                    if (refused) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path} (${plural(result.rewritten, "link")}), no update permission: ${refused}`);
+                        continue;
+                    }
+                    if (!(await vault.writeNote(path, result.content, { mode: "update" }))) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path} (${plural(result.rewritten, "link")}), the write failed`);
+                        continue;
+                    }
+                    searchIndex.update(path, result.content, Date.now());
+                    rewrittenNotes++;
+                    rewrittenLinks += result.rewritten;
+                    details.push(`- Rewritten: ${path} (${plural(result.rewritten, "link")})${ambiguous}`);
+                } catch (err) {
+                    skipped++;
+                    details.push(`- Not rewritten: ${path}, ${err instanceof NoteNotFoundError ? "the note is gone" : `error: ${(err as Error).message}`}`);
+                }
+            }
+            if (update_links === false) {
+                lines.push("Links: not updated (update_links=false).");
+            } else {
+                lines.push(`Links: ${plural(rewrittenLinks, "link")} rewritten in ${plural(rewrittenNotes, "note")}; ${skipped} not rewritten; ${unchanged} unchanged.`);
+                if (searchIndex.state !== "ready") {
+                    lines.push(`The search index is still ${searchIndex.state}, so notes linking to ${from} may be missing from this list.`);
+                }
+            }
+            lines.push(...details);
+            lines.push(`[Open in Obsidian](${makeDeepLink(vaultName, to)})`);
+            return lines.join("\n");
+        },
+    });
+
     server.addTool({
         name: "get_note_metadata",
         description:
@@ -576,4 +701,8 @@ export function registerTools(
             return lines.join("\n");
         },
     });
+}
+
+function plural(n: number, word: string): string {
+    return `${n} ${word}${n === 1 ? "" : "s"}`;
 }

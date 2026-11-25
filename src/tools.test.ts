@@ -222,7 +222,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
     it("READ_ONLY wins over WRITE_FOLDERS: no write tools at all", async () => {
         const { tools } = await setup("MCP", true);
         const names = tools.map((t) => t.name);
-        for (const w of ["write_note", "edit_note", "delete_note", "move_note"]) assert.ok(!names.includes(w), w);
+        for (const w of ["write_note", "edit_note", "delete_note", "move_note", "rename_note"]) assert.ok(!names.includes(w), w);
     });
 
     it("create-only: refusals read the same whether or not the note exists", async () => {
@@ -232,6 +232,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
             ["edit_note", (p) => ({ path: p, content: "y" })],
             ["delete_note", (p) => ({ path: p })],
             ["move_note", (p) => ({ from: p, to: "MCP/moved.md" })],
+            ["rename_note", (p) => ({ from: p, to: "MCP/moved.md" })],
         ];
         for (const [tool, args] of pairs) {
             const a = await call(tool, args("Raw/exists.md"));
