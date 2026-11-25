@@ -558,3 +558,99 @@ describe("revisions (expected_revision)", () => {
         assert.match(await tool.execute(tool.parameters.parse({ path: "Raw/a.md", content: "v2", expected_revision: "1-a" }), {}), /allows only create/);
     });
 });
+
+describe("query_notes tool", () => {
+    function setup(state: "ready" | "building" = "ready") {
+        const index = new SearchIndex();
+        index.update("Recipes/Bread.md", "---\ntitle: Sourdough bread\ntype: recipe\nstatus: draft\n---\n", 3);
+        index.update("Recipes/Soup.md", "---\ntype: recipe\nstatus: ready\n---\n", 2);
+        index.update("Projects/Garden plan.md", "---\ntype: project\nstatus: draft\n---\n", 1);
+        index.state = state;
+        const tools: any[] = [];
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, index, "vault");
+        const tool = tools.find((t) => t.name === "query_notes");
+        return { tool, index, call: (args: Record<string, unknown>) => tool.execute(tool.parameters.parse(args), {}) as Promise<string> };
+    }
+
+    it("is registered, read-only, with a whole first sentence under 75 characters", () => {
+        const tools: any[] = [];
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, {} as any, "vault", true);
+        const tool = tools.find((t) => t.name === "query_notes");
+        assert.ok(tool, "registered in READ_ONLY mode too");
+        const firstLine = String(tool.description).split("\n")[0];
+        assert.ok(firstLine.length < 75 && firstLine.endsWith("."), firstLine);
+    });
+
+    it("schema: limit at most 500, op from the list", () => {
+        const { tool } = setup();
+        assert.equal(tool.parameters.safeParse({ limit: 500 }).success, true);
+        assert.equal(tool.parameters.safeParse({ limit: 501 }).success, false);
+        assert.equal(tool.parameters.safeParse({ limit: 0 }).success, false);
+        assert.equal(tool.parameters.safeParse({ where: [{ field: "a", op: "like", value: "x" }] }).success, false);
+    });
+
+    it("answers with the total line, then one row per note with a deep link", async () => {
+        const { call } = setup();
+        const text = await call({ where: [{ field: "status", op: "eq", value: "draft" }], select: ["title", "type"] });
+        const lines = text.split("\n");
+        assert.equal(lines[0], "2 notes match; showing 1-2.");
+        assert.match(lines[1], /^- \[Projects\/Garden plan\.md\]\(obsidian:\/\/[^)]+\) · title: Garden plan · type: project$/);
+        assert.match(lines[2], /^- \[Recipes\/Bread\.md\]\(obsidian:\/\/[^)]+\) · title: Sourdough bread · type: recipe$/);
+    });
+
+    it("pages with the cursor from the first line", async () => {
+        const { call } = setup();
+        const first = await call({ limit: 2, sort: { field: "mtime", order: "desc" } });
+        const cursor = first.split("\n")[0].match(/next cursor: (\S+)$/)?.[1];
+        assert.ok(cursor, first);
+        assert.ok(first.startsWith("3 notes match; showing 1-2; next cursor: "));
+        const second = await call({ limit: 2, sort: { field: "mtime", order: "desc" }, cursor });
+        assert.match(second, /^3 notes match; showing 3-3\.\n- \[Projects\/Garden plan\.md\]/);
+        assert.match(await call({ cursor }), /different where, sort, folder or tag/);
+    });
+
+    it("format json", async () => {
+        const { call } = setup();
+        const json = JSON.parse(await call({ format: "json", where: [{ field: "type", op: "eq", value: "recipe" }], select: ["status"] }));
+        assert.deepEqual(json, {
+            total: 2, shown: 2, start: 1, next_cursor: null, index: "ready", warnings: [],
+            rows: [{ path: "Recipes/Bread.md", status: "draft" }, { path: "Recipes/Soup.md", status: "ready" }],
+        });
+    });
+
+    it("says when the index is still building or a field exists nowhere, on the second line", async () => {
+        const { call } = setup("building");
+        const lines = (await call({ where: [{ field: "stauts", op: "eq", value: "draft" }] })).split("\n");
+        assert.equal(lines[0], "0 notes match.");
+        assert.match(lines[1], /^Note: Index: catching up \(3 notes indexed so far\); this list may be incomplete\. No note has "stauts"/);
+        const paged = (await call({ limit: 1 })).split("\n");
+        assert.match(paged[0], /^3 notes match; showing 1-1; next cursor: \S+$/, "the cursor stays the last token of the first line");
+        assert.match(paged[1], /^Note: Index: catching up/);
+    });
+
+    it("ignores inherited object keys as fields", async () => {
+        const { call } = setup();
+        assert.equal((await call({ where: [{ field: "toString", op: "exists" }] })).split("\n")[0], "0 notes match.");
+        const text = await call({ select: ["constructor", "__proto__"], limit: 1 });
+        assert.match(text.split("\n")[1], / · constructor: \(missing\) · __proto__: \(missing\)$/);
+    });
+
+    it("runs the vault catch-up first and reports its failure", async () => {
+        const index = new SearchIndex();
+        const tools: any[] = [];
+        let synced = 0;
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, index, "vault", false, null, async () => {
+            synced++;
+            index.update("a.md", "---\ntype: recipe\n---\n", 1);
+            return { unreadable: 1, error: "timeout" };
+        });
+        index.state = "ready";
+        const tool = tools.find((t) => t.name === "query_notes");
+        const text: string = await tool.execute(tool.parameters.parse({}), {});
+        assert.equal(synced, 1);
+        const lines = text.split("\n");
+        assert.equal(lines[0], "1 note matches; showing 1-1.");
+        assert.equal(lines[1], "Note: Catch-up with the vault failed (timeout); results may be stale. 1 document(s) could not be read and are not counted.");
+    });
+});
+
