@@ -603,6 +603,19 @@ describe("E2E: READ_ONLY mode", () => {
     });
 });
 
+describe("E2E: SEARCH_DEFAULT_EXCLUDE", () => {
+    it("leaves the folders out of search_notes and says so on the status line", async () => {
+        await stopServer();
+        await startServer({ VAULT_PATH: vaultDir, VAULT_NAME: "TestVault", READ_ONLY: "true", SEARCH_DEFAULT_EXCLUDE: "daily" });
+        assert.ok(serverLogs.includes("SEARCH_DEFAULT_EXCLUDE: search_notes leaves out daily/ unless asked."), serverLogs);
+        const text = await callTool("search_notes", { terms: ["daily note"] });
+        assert.match(text.split("\n")[0], / Excluded by default: daily\/ \(1 matching note\); pass folder to search there\.$/);
+        assert.equal(text.split("\n")[1], 'No notes match "daily note".');
+        const inside = await callTool("search_notes", { terms: ["daily note"], folder: "daily" });
+        assert.match(inside.split("\n")[1], /^1 note matches/);
+    });
+});
+
 describe("E2E: WRITE_FOLDERS permissions", () => {
     it("Raw:create allows new notes but refuses overwrite, edit, delete and move", async () => {
         await stopServer();

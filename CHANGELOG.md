@@ -7,6 +7,9 @@
 - **Concurrent edits no longer lose changes (CouchDB mode, #2).** `edit_note` writes only if the note is still at the revision it read, and otherwise re-reads and re-applies the edit (at least 10 rounds and 3 seconds), so agents editing the same note at once, through one instance or several on the same database, no longer overwrite each other; an edit that still can't get through is refused with a message, never dropped. Before, every call answered "Note edited" while most of the edits were silently overwritten or left as hidden conflict revisions. `read_note` and `get_note_metadata` now show the note's revision, and `write_note` and `edit_note` take an optional `expected_revision` that refuses the write when the note has changed since. Local mode is unchanged and refuses `expected_revision`.
 - **`op_id` makes retried writes safe (opt-in, CouchDB mode).** Set `OPS_DATABASE` to a database name and the write tools accept an `op_id`: a call repeated with the same id (an agent retrying after a timeout) returns the first answer instead of appending or writing again. Records live in that separate database, so they work across server instances and restarts and are never synced to Obsidian. Without `OPS_DATABASE` nothing changes and `op_id` is refused.
 - **Plugins (`PLUGIN_DIR`, opt-in).** Add your own tools without forking: each `.js`/`.mjs` file in the directory registers tools at startup through a small context whose vault calls apply the same `READ_ONLY` and `WRITE_FOLDERS` checks as the built-in tools. A plugin that fails to load, or reuses a tool name, stops startup with a message naming the file.
+- **`search_notes` matches words, not substrings.** A term with several words matches a note that contains all of them in any order (`garden plan` finds "the plan for the garden"), words match whole (`ups` no longer finds "backups"), and a hyphen and a space between words are the same (`site-loss` == `site loss`). See [search matching](README.md#search-matching).
+- Frontmatter `aliases` and the `summary` and `case` properties are searched together with the path and title, so their hits rank above plain text hits.
+- `SEARCH_DEFAULT_EXCLUDE` (comma-separated folders) leaves those folders out of `search_notes` unless `folder` points inside one. The status line says which folders were left out and how many matching notes they held. Unset keeps today's behaviour.
 
 ### Fixes
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
@@ -14,6 +17,12 @@
 ### Tests
 - `npm run test:concurrency`: concurrent `edit_note` calls through two server instances on one throwaway CouchDB database, read back straight from CouchDB with conflict revisions; `--load 4x50` measures lost edits and latency.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
+
+### Breaking changes
+- `search_notes` no longer matches part of a word: `backup` does not find "backups", and `drag kanban` finds notes with both words anywhere, not only the phrase. A term made only of hyphens and spaces (`---`) matches nothing. A query with more than 100 distinct words is refused.
+
+### Performance
+- The first start after upgrading parses every note once, to index aliases and the summary and case properties.
 
 ## 0.13.0
 

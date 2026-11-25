@@ -10,7 +10,7 @@
  * hide a silent miss.
  */
 
-import type { IndexState, SearchHit } from "./search.js";
+import { activeExcludes, type IndexState, type SearchHit } from "./search.js";
 
 /**
  * Validate a display zone once. An unknown zone makes Intl.DateTimeFormat
@@ -105,6 +105,18 @@ export function describeSync(s: SyncStatus, timeZone: string = DISPLAY_TIMEZONE)
         line += `; ${plural(s.unreadable, "document")} could not be read`;
     }
     return line + ".";
+}
+
+/**
+ * Appended to the status line when SEARCH_DEFAULT_EXCLUDE is set, so the
+ * exclusion is never silent: which folders were left out and how many
+ * matching notes they held. Empty when nothing is excluded, including when
+ * `folder` lies inside every excluded folder.
+ */
+export function describeExcluded(exclude: string[], folder: string | undefined, hits: number): string {
+    const active = activeExcludes(exclude, folder);
+    if (active.length === 0) return "";
+    return ` Excluded by default: ${active.join(", ")} (${plural(hits, "matching note")}); pass folder to search there.`;
 }
 
 /** What was searched, for the second line. */

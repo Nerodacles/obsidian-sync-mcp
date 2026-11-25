@@ -207,7 +207,7 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | `list_folders` | List all folders in the vault with note counts — use to discover folder names |
 | `list_tags` | List all tags in the vault with counts — use to discover tags before filtering |
 | `list_notes` | List notes with timestamps. Filter by folder, name, tag, or date. Sort by name or modified. |
-| `search_notes` | Search note text for terms (OR, case-insensitive substrings); paths and frontmatter titles are searched first. Filter by folder, tag, or date. Returns paths with one context line each, never the note body, after a status line that states which CouchDB sequence the index is caught up with. |
+| `search_notes` | Search note text for terms (OR, case-insensitive whole words, see [search matching](#search-matching)); paths, frontmatter titles, aliases and the `summary` and `case` properties are searched first. Filter by folder, tag, or date. Returns paths with one context line each, never the note body, after a status line that states which CouchDB sequence the index is caught up with. |
 | `delete_note` | Delete a note |
 | `move_note` | Move or rename a note — works across folders, creates destination folders automatically |
 | `get_note_metadata` | Get frontmatter, tags, outgoing links, backlinks, size, timestamps and (CouchDB mode) revision — navigate the knowledge graph |
@@ -246,6 +246,20 @@ export default function register(ctx) {
 ```
 
 `ctx.vault` offers `readNote`, `getMetadata`, `listNotes`, `writeNote` (with `createOnly`), `editNote`, `deleteNote` and `moveNote`. Its writes pass the same checks as the built-in tools — `READ_ONLY`, `WRITE_FOLDERS` with its create/update/delete permissions — use the same write path, and keep the search index current; a refused write is returned to the agent as the tool's answer. Startup fails if a plugin doesn't load, throws, or adds a tool whose name is already taken. Plugins run inside the server process with its rights: the context gives no way around the checks, but install only code you trust as much as the server.
+
+### Search matching
+
+`search_notes` takes a list of terms and returns the notes that match **any** of them, ranked by how many terms matched.
+
+- A term matches when **all** its words occur in the note, in any order: `garden plan` finds "the plan for the garden" as well as "Garden plan".
+- Words match whole and case-insensitively: `ups` finds "UPS" but not "backups", and `backup` does not find "backups".
+- Spaces and hyphens separate the words of a term, so `site-loss` and `site loss` are the same term. Any other character is part of a word and matched as written, so `[[welcome]]`, `#project` and `projects/` work as before. A term made only of spaces and hyphens matches nothing.
+- A word may not continue into a letter, combining mark or digit in the note where it starts or ends with one: `ups` finds "UPS," and "ups-and-downs", not "backups".
+- The path, the frontmatter `title`, the `aliases` and the `summary` and `case` properties are the name fields. A term whose words all occur in them is a name hit (marked `[path/title]`), and name hits rank above notes that match only in their text.
+- At most 100 distinct words across all terms; a longer query is refused rather than shortened.
+- Languages written without spaces between words (Chinese, Japanese) are matched by runs of characters, so search for a whole run.
+
+With `SEARCH_DEFAULT_EXCLUDE` set, notes in those folders are left out unless the `folder` parameter points inside one of them. The status line then says which folders were left out and how many matching notes they held, so a hit is never hidden silently.
 
 ### Attachments (opt-in)
 
@@ -319,6 +333,7 @@ Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable fo
 | `DATA_DIR` | Optional | `~/.obsidian-mcp` | Directory for persisted data (metadata index, auth tokens) |
 | `LOG_LEVEL` | Optional | — | Set to `debug` for verbose logging (library logs, change feed, index sync) |
 | `DISPLAY_TIMEZONE` | Optional | server's zone | IANA time zone for the human-readable half of the server time in `search_notes` status lines (UTC is always printed beside it), e.g. `Europe/Berlin`. An invalid zone falls back to UTC with a warning at startup |
+| `SEARCH_DEFAULT_EXCLUDE` | Optional | — | Comma-separated folders that `search_notes` leaves out by default, e.g. `Archive,Templates`. Matching is folder-boundary-aware (`Archive` leaves out `Archive/old.md`, not `Archived/x.md`). A search whose `folder` lies inside an excluded folder searches it. While set, the status line of every search says which folders were left out and how many matching notes they held. Unset or empty: every folder is searched |
 | `MCP_REFRESH_DAYS` | Optional | `14` | Days before auth session expires |
 | `READ_ONLY` | Optional | `false` | Set to `true` to disable all write tools (`write_note`, `edit_note`, `delete_note`, `move_note`). Only read tools are exposed via MCP, and the vault backend rejects writes as well. Useful when sharing the server with multiple AI clients and write access should be opt-in. This protects the vault from MCP clients; it is not a database-level guarantee. To make CouchDB itself refuse writes, use CouchDB-side controls, such as a `validate_doc_update` function that rejects the server's CouchDB user. |
 | `OPS_DATABASE` | Optional | — | CouchDB mode. Name of a separate CouchDB database for `op_id` records (created at startup if missing, which needs a user allowed to create databases; otherwise create it once as admin and give the server's user access). Never the vault database. Unset: `op_id` is refused and nothing else changes. |

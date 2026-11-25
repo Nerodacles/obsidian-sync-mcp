@@ -9,15 +9,17 @@ import { SUPPORTED_ATTACHMENT_EXTENSIONS, isValidAttachmentPath } from "./attach
 /**
  * Changes whenever parseFrontmatterAndLinks may return something different for
  * the same note, so metadata the search index saved from an older parser is
- * parsed again, not reused. Bump the number when changing the parser; the
- * attachment extensions are part of it because they decide which link targets
- * count.
+ * parsed again, not reused. Bump the number when changing the parser or what
+ * the index keeps from its result; the attachment extensions are part of it
+ * because they decide which link targets count.
  */
-export const PARSER_VERSION = `4:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
+export const PARSER_VERSION = `6:${SUPPORTED_ATTACHMENT_EXTENSIONS.join(",")}`;
 
 export interface NoteMetadata {
     frontmatter: Record<string, string>;
     tags: string[];
+    /** Frontmatter `aliases`: a list, or a string of comma- or line-separated aliases, as for `tags`. */
+    aliases: string[];
     links: string[];
     /** Why the frontmatter was ignored, when it isn't valid YAML. */
     frontmatterError?: string;
@@ -73,7 +75,7 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
     const yaml = fm?.[1] ?? "";
     const body = fm ? content.slice(fm[0].length) : content;
 
-    const { frontmatter, tags: yamlTags, error } = readFrontmatter(yaml);
+    const { frontmatter, tags: yamlTags, aliases, error } = readFrontmatter(yaml);
     const { text, links } = readBody(body);
     const tags = new Set(yamlTags);
     // Wikilinks in properties (related: "[[Note]]") count too.
@@ -84,7 +86,7 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
     for (const match of text.matchAll(TAG)) {
         if (!/^\p{Nd}+$/u.test(match[2])) tags.add(match[2]);
     }
-    const metadata: NoteMetadata = { frontmatter, tags: [...tags], links: [...new Set(links)] };
+    const metadata: NoteMetadata = { frontmatter, tags: [...tags], aliases, links: [...new Set(links)] };
     if (error) metadata.frontmatterError = error;
     return metadata;
 }
@@ -92,18 +94,19 @@ export function parseFrontmatterAndLinks(content: string): NoteMetadata {
 /**
  * Frontmatter as YAML ("failsafe": every value is a string as written, so 1.10
  * stays 1.10 and dates aren't converted). A list of plain values is joined
- * with ", ", anything else is kept as written. Tags come from `tags`: a list,
- * or a string of comma- or line-separated tags. Frontmatter that isn't valid
- * YAML is ignored, as Obsidian does.
+ * with ", ", anything else is kept as written. Tags come from `tags` and
+ * aliases from `aliases`: a list, or a string of comma- or line-separated
+ * values. Frontmatter that isn't valid YAML is ignored, as Obsidian does.
  */
-function readFrontmatter(yaml: string): { frontmatter: Record<string, string>; tags: string[]; error?: string } {
+function readFrontmatter(yaml: string): { frontmatter: Record<string, string>; tags: string[]; aliases: string[]; error?: string } {
     const frontmatter: Record<string, string> = {};
     const tags: string[] = [];
+    const aliases: string[] = [];
     const doc = parseDocument(yaml, { schema: "failsafe", uniqueKeys: false });
     // The first line of yaml's message, without the snippet it introduces:
     // "Invalid escape sequence \Users\me" at line 1, column 10".
-    if (doc.errors.length > 0) return { frontmatter, tags, error: doc.errors[0].message.split("\n")[0].replace(/:$/, "") };
-    if (!isMap(doc.contents)) return { frontmatter, tags };
+    if (doc.errors.length > 0) return { frontmatter, tags, aliases, error: doc.errors[0].message.split("\n")[0].replace(/:$/, "") };
+    if (!isMap(doc.contents)) return { frontmatter, tags, aliases };
 
     const resolve = aliasResolver(doc);
     for (const pair of doc.contents.items) {
@@ -112,11 +115,12 @@ function readFrontmatter(yaml: string): { frontmatter: Record<string, string>; t
         const value = resolve(pair.value);
         const shown = showValue(value, resolve, yaml);
         if (shown) frontmatter[String(key.value)] = shown;
-        if (key.value !== "tags") continue;
+        const list = key.value === "tags" ? tags : key.value === "aliases" ? aliases : null;
+        if (!list) continue;
         const raw = isScalar(value) ? String(value.value).split(/[,\n]/) : isSeq(value) ? scalars(value, resolve) : [];
-        for (const tag of raw) if (tag.trim()) tags.push(tag.trim());
+        for (const item of raw) if (item.trim() && !list.includes(item.trim())) list.push(item.trim());
     }
-    return { frontmatter, tags };
+    return { frontmatter, tags, aliases };
 }
 
 type Resolve = (node: unknown) => unknown;

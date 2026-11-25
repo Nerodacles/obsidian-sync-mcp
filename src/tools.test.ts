@@ -628,3 +628,83 @@ describe("op_id (idempotent writes)", () => {
         } finally { await cleanup(); }
     });
 });
+
+describe("search_notes with SEARCH_DEFAULT_EXCLUDE", () => {
+    function setup(exclude: string[]) {
+        const searchIndex = new SearchIndex();
+        searchIndex.update("Archive/old plan.md", "Garden plan from last year.", 1);
+        searchIndex.update("Archive/older plan.md", "Another garden plan.", 2);
+        searchIndex.update("Projects/Garden plan.md", "Garden plan for this year.", 3);
+        const tools: any[] = [];
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, searchIndex, "vault", true, null, undefined, undefined, exclude);
+        const search = (args: any): Promise<string> => {
+            const tool = tools.find((t) => t.name === "search_notes");
+            return tool.execute(tool.parameters.parse(args), {});
+        };
+        return { search, tools };
+    }
+
+    it("leaves excluded folders out and says how many matching notes they held on the status line", async () => {
+        const out = await setup(["Archive/"]).search({ terms: ["garden"] });
+        const [status, header] = out.split("\n");
+        assert.match(status, /^Index: local vault, no sequence — .*\. Excluded by default: Archive\/ \(2 matching notes\); pass folder to search there\.$/);
+        assert.match(header, /^1 note matches "garden"\./);
+        assert.ok(!out.includes("Archive/old plan.md"));
+    });
+
+    it("says so even when nothing matched", async () => {
+        const out = await setup(["Archive/"]).search({ terms: ["nothing"] });
+        assert.match(out.split("\n")[0], /Excluded by default: Archive\/ \(0 matching notes\)/);
+        assert.match(out.split("\n")[1], /^No notes match "nothing"\.$/);
+    });
+
+    it("a folder inside an excluded one searches it, without the note", async () => {
+        const out = await setup(["Archive/"]).search({ terms: ["garden"], folder: "Archive" });
+        assert.ok(!out.includes("Excluded by default"));
+        assert.match(out.split("\n")[1], /^2 notes match "garden"\./);
+    });
+
+    it("unset: the answer is the same as without the parameter", async () => {
+        const withEmpty = await setup([]).search({ terms: ["garden"] });
+        const tools: any[] = [];
+        const idx = new SearchIndex();
+        idx.update("Archive/old plan.md", "Garden plan from last year.", 1);
+        idx.update("Archive/older plan.md", "Another garden plan.", 2);
+        idx.update("Projects/Garden plan.md", "Garden plan for this year.", 3);
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, idx, "vault", true, null, undefined);
+        const tool = tools.find((t) => t.name === "search_notes");
+        const without = await tool.execute(tool.parameters.parse({ terms: ["garden"] }), {});
+        // Only the server time may differ between the two calls.
+        const strip = (s: string) => s.replace(/\d{4}-\d\d-\d\d \d\d:\d\d \S+ \(\d\d:\d\dZ\)/, "<time>");
+        assert.equal(strip(withEmpty), strip(without));
+        assert.ok(!withEmpty.includes("Excluded"));
+        assert.match(withEmpty.split("\n")[1], /^3 notes match "garden"\./);
+    });
+
+    it("the tool description names the excluded folders only when set", () => {
+        const set = setup(["Archive/"]).tools.find((t) => t.name === "search_notes");
+        const unset = setup([]).tools.find((t) => t.name === "search_notes");
+        assert.match(set.description, /folders Archive\/ are left out/);
+        assert.ok(!unset.description.includes("left out"));
+    });
+
+    it("parseSearchExclude normalises folder prefixes", async () => {
+        const mod: any = await import("./search.js");
+        assert.equal(typeof mod.parseSearchExclude, "function");
+        assert.deepEqual(mod.parseSearchExclude(undefined), []);
+        assert.deepEqual(mod.parseSearchExclude(""), []);
+        assert.deepEqual(mod.parseSearchExclude(" Archive , /Inbox/old/, Archive/,\\Trash\\ ,, "), ["Archive/", "Inbox/old/", "Trash/"]);
+    });
+});
+
+test("search_notes refuses more than SEARCH_MAX_WORDS distinct words instead of dropping some", async () => {
+    const mod: any = await import("./tools.js");
+    assert.equal(typeof mod.SEARCH_MAX_WORDS, "number");
+    const tools: any[] = [];
+    registerTools({ addTool: (t: any) => tools.push(t) } as any, {} as any, new SearchIndex(), "vault", true);
+    const tool = tools.find((t) => t.name === "search_notes");
+    const words = (from: number, n: number) => Array.from({ length: n }, (_, i) => `w${from + i}`).join(" ");
+    const terms = Array.from({ length: Math.ceil((mod.SEARCH_MAX_WORDS + 1) / 10) }, (_, i) => words(i * 10, 10));
+    const out = await tool.execute(tool.parameters.parse({ terms }), {});
+    assert.match(out, /^Too many words: \d+ distinct words across all terms, at most \d+\./);
+});

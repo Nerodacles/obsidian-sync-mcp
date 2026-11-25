@@ -18,6 +18,14 @@ status: draft
         assert.equal(result.frontmatter.status, "draft");
     });
 
+    it("reads frontmatter aliases from a list or a comma-separated string", () => {
+        assert.deepEqual(parseFrontmatterAndLinks("---\naliases: [Garden, Veg patch]\n---\nText").aliases, ["Garden", "Veg patch"]);
+        assert.deepEqual(parseFrontmatterAndLinks("---\naliases:\n  - Garden\n  - Garden\n---\n").aliases, ["Garden"]);
+        assert.deepEqual(parseFrontmatterAndLinks("---\naliases: Garden, Veg patch\n---\n").aliases, ["Garden", "Veg patch"]);
+        assert.deepEqual(parseFrontmatterAndLinks("---\ntitle: x\n---\n").aliases, []);
+        assert.deepEqual(parseFrontmatterAndLinks("No frontmatter").aliases, []);
+    });
+
     it("parses frontmatter tags", () => {
         const content = `---
 tags: [project, active, important]
