@@ -119,7 +119,7 @@ export function registerTools(
      * re-applied to the new text, so nobody's change is lost. `label` names the
      * change in the answer: "Note edited (<label>)".
      */
-    async function editExisting(path: string, label: string, apply: (existing: string) => string, expectedRevision?: string): Promise<string> {
+    async function editExisting(tool: string, path: string, label: string, apply: (existing: string) => string, expectedRevision?: string): Promise<string> {
         if (vault.updateNote) {
             try {
                 const { content: updated, revision, attempts } = await vault.updateNote(path, apply, {
@@ -127,7 +127,7 @@ export function registerTools(
                     maxAttempts: EDIT_MAX_ATTEMPTS,
                     minRetryMs: EDIT_MIN_RETRY_MS,
                 });
-                if (debugLogging && attempts > 1) console.log(`[tool] ${label} applied after ${attempts} attempts`);
+                if (debugLogging && attempts > 1) console.log(`[tool] ${tool} applied after ${attempts} attempts`);
                 searchIndex.update(path, updated, Date.now());
                 return `Note edited (${label}): ${path}\nRevision: ${revision}\n[Open in Obsidian](${makeDeepLink(vaultName, path)})`;
             } catch (err) {
@@ -483,7 +483,7 @@ export function registerTools(
             const denied = checkWrite(path, "update", writeFolders);
             if (denied) return denied;
             const op = operation ?? "append";
-            return await editExisting(path, op, (existing) => applyEdit(existing, op, newContent, old_text), expected_revision);
+            return await editExisting("edit_note", path, op, (existing) => applyEdit(existing, op, newContent, old_text), expected_revision);
         },
     });
 
@@ -505,7 +505,7 @@ export function registerTools(
         execute: async ({ path, set, remove, expected_revision }) => {
             const denied = checkWrite(path, "update", writeFolders);
             if (denied) return denied;
-            return await editExisting(path, "set_properties", (existing) => setProperties(existing, set, remove), expected_revision);
+            return await editExisting("set_properties", path, "set_properties", (existing) => setProperties(existing, set, remove), expected_revision);
         },
     });
 
@@ -522,7 +522,7 @@ export function registerTools(
         execute: async ({ path, heading, line, create_heading }) => {
             const denied = checkWrite(path, "update", writeFolders);
             if (denied) return denied;
-            return await editExisting(path, "append_to_section", (existing) => appendToSection(existing, heading, line, create_heading ?? false));
+            return await editExisting("append_to_section", path, "append_to_section", (existing) => appendToSection(existing, heading, line, create_heading ?? false));
         },
     });
 
