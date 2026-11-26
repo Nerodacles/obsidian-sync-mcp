@@ -264,6 +264,25 @@ export default function register(ctx) {
 
 `ctx.vault` offers `readNote`, `getMetadata`, `listNotes`, `writeNote` (with `createOnly`), `editNote`, `deleteNote` and `moveNote`. Its writes pass the same checks as the built-in tools — `READ_ONLY`, `WRITE_FOLDERS` with its create/update/delete permissions — use the same write path, and keep the search index current; a refused write is returned to the agent as the tool's answer. Startup fails if a plugin doesn't load, throws, or adds a tool whose name is already taken. Plugins run inside the server process with its rights: the context gives no way around the checks, but install only code you trust as much as the server.
 
+A refused write throws a `PluginWriteError` whose `code` says why: `exists` (a create-only write found a note there), `denied` (`WRITE_FOLDERS`), `read_only`, `not_found`, `revision_mismatch`, `unsupported` or `failed`. A plugin that doesn't catch it returns its message to the agent; one that does can react, for example by trying another path on `exists`.
+
+Plugin tools don't take `op_id`: the server's operation records cover its built-in write tools only.
+
+**`ctx.store` (with `OPS_DATABASE`).** A plugin that needs state shared by every server instance on the vault (a counter, a marker) gets a small key/value store, kept in the `OPS_DATABASE` database next to the `op_id` records and never synced to Obsidian. It is present only when `OPS_DATABASE` is set and the server isn't `READ_ONLY`; otherwise `ctx.store` is `undefined`, so check before using it.
+
+```js
+const cur = await ctx.store.get("counter");             // { value, revision } or null
+const res = await ctx.store.put("counter", (cur?.value ?? 0) + 1, cur?.revision ?? null);
+if (res.conflict) { /* someone else wrote first: res.current is what is there now (or null) */ }
+```
+
+- `get(key)` returns `{ value, revision }`, or `null` when the key has no value.
+- `put(key, value, expectedRevision)` writes only if the key is still at `expectedRevision`; `null` means "only if the key has no value yet". It returns `{ revision }`, or `{ conflict: true, current }` with what is there now, so the plugin can decide again. That compare-and-swap is the only concurrency control: no locks, no transactions across keys.
+- Keys are 1-128 characters of `A-Z a-z 0-9 . _ -`. Each plugin file has its own keys (stored as `plugin:<file name>:<key>`), so two plugins can't see or overwrite each other's. Values are JSON, at most 64 KiB; a value that isn't JSON (a `Date`, a `Map`) is stored as `JSON.stringify` makes it.
+- A CouchDB failure other than a conflict (credentials, the database unreachable) throws; it is never reported as a conflict. There is no delete.
+
+[`examples/new-item.mjs`](examples/new-item.mjs) uses both: it creates numbered notes (`<folder>/<prefix>-NNN.md`) whose numbers stay unique across instances, from a counter in `ctx.store` and create-only writes that move to the next number on `exists`. `npm run test:new-item` runs it on two instances against a throwaway CouchDB.
+
 ### Search matching
 
 `search_notes` takes a list of terms and returns the notes that match **any** of them, ranked by how many terms matched.
