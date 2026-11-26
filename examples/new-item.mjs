@@ -16,8 +16,9 @@
  *     there first), re-read the counter and try the next free candidate, up to
  *     MAX_CREATE_ATTEMPTS times; nothing is written when every attempt is refused;
  *  4. raise the counter to the number used, by compare-and-swap, never lowering
- *     it. If that fails the note still exists and the answer says so: the next
- *     call finds the note in step 2.
+ *     it. If that fails (conflicts to the bound, or a CouchDB error) the note
+ *     still exists and the answer gives its id with a warning: the next call
+ *     finds the note in step 2.
  *
  * Gaps: a number is skipped only when a create at it was refused.
  *
@@ -144,21 +145,28 @@ export async function createItem({ store, vault }, render) {
     }
     if (!created) return { created: false, skipped };
 
-    // Raise the counter to n, never lowering it.
+    // Raise the counter to n, never lowering it. The note exists by now, so a
+    // failure here is reported with the result, never thrown: an error answer
+    // would hide the id and invite a retry that creates a second item.
     let counterRaised = false;
-    for (let attempt = 0; attempt < MAX_RAISE_ATTEMPTS; attempt++) {
-        if (counterValue(counter) >= n) {
-            counterRaised = true;
-            break;
+    let counterError;
+    try {
+        for (let attempt = 0; attempt < MAX_RAISE_ATTEMPTS; attempt++) {
+            if (counterValue(counter) >= n) {
+                counterRaised = true;
+                break;
+            }
+            const res = await store.put(COUNTER_KEY, n, counter?.revision ?? null);
+            if (!res.conflict) {
+                counterRaised = true;
+                break;
+            }
+            counter = res.current;
         }
-        const res = await store.put(COUNTER_KEY, n, counter?.revision ?? null);
-        if (!res.conflict) {
-            counterRaised = true;
-            break;
-        }
-        counter = res.current;
+    } catch (err) {
+        counterError = err instanceof Error ? err.message : String(err);
     }
-    return { created: true, n, path: itemPath(n), skipped, counterRaised };
+    return { created: true, n, path: itemPath(n), skipped, counterRaised, ...(counterError ? { counterError } : {}) };
 }
 
 export default function register(ctx) {
@@ -196,7 +204,9 @@ export default function register(ctx) {
             const id = formatId(result.n);
             const lines = [`Created ${id}: ${result.path}`, `[Open in Obsidian](${deepLink(ctx.vaultName, result.path)})`];
             if (result.skipped.length) lines.push(`Taken by other callers first: ${result.skipped.map(formatId).join(", ")}.`);
-            if (!result.counterRaised) lines.push(`Warning: the counter could not be raised to ${result.n}; the note exists, and the next call still sees it in ${FOLDER}.`);
+            if (!result.counterRaised) {
+                lines.push(`Warning: the counter could not be raised to ${result.n}${result.counterError ? ` (${result.counterError})` : ""}; the note exists, and the next call still sees it in ${FOLDER}.`);
+            }
             return lines.join("\n");
         },
     });

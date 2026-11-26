@@ -143,6 +143,15 @@ describe("new_item plugin: numbering", () => {
         assert.equal(await store.get("counter"), null);
     });
 
+    it("a CouchDB error while raising the counter still answers with the created note", async () => {
+        const store = scopedStore(new MemoryDocStore(), "new-item.mjs");
+        const vault = stubVault();
+        store.put = async () => { throw new Error("plugin store write failed: 503 Service Unavailable"); };
+        const r = await createItem({ store, vault }, () => "");
+        assert.deepEqual(r, { created: true, n: 1, path: "ToDo/items/moo-001.md", skipped: [], counterRaised: false, counterError: "plugin store write failed: 503 Service Unavailable" });
+        assert.ok(vault.notes.has("ToDo/items/moo-001.md"));
+    });
+
     it("a counter that fails to rise is a warning, not a lost note", async () => {
         const store = scopedStore(new MemoryDocStore(), "new-item.mjs");
         const vault = stubVault();
@@ -260,6 +269,14 @@ describe("new_item plugin: loaded by the server", () => {
         const noStore = await setup("ToDo:create+update", false);
         assert.match(await noStore.call({ title: "x" }), /needs OPS_DATABASE[\s\S]*Nothing was written/);
         assert.deepEqual(await noStore.vault.listNotes("ToDo"), []);
+    });
+
+    it("a counter failure is a warning in the answer, with the id", async () => {
+        const { call, docs } = await setup("ToDo:create+update");
+        docs.putDoc = async () => { throw new Error("plugin store write failed: 503 Service Unavailable"); };
+        const answer = await call({ title: "x" });
+        assert.match(answer, /^Created moo-001: ToDo\/items\/moo-001\.md\n/);
+        assert.match(answer, /Warning: the counter could not be raised to 1 \(plugin store write failed: 503 Service Unavailable\); the note exists/);
     });
 
     it("WRITE_FOLDERS applies: outside the scope it is refused with the server's message", async () => {
