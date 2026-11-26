@@ -116,7 +116,7 @@
           "name": "PORT"
         },
         {
-          "description": "Set to 'true' to disable all write tools (write_note, edit_note, delete_note, move_note). Useful when exposing the server to multiple AI clients.",
+          "description": "Set to 'true' to disable all write tools (write_note, edit_note, set_properties, append_to_section, delete_note, move_note). Useful when exposing the server to multiple AI clients.",
           "isRequired": false,
           "format": "string",
           "isSecret": false,
