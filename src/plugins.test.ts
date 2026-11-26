@@ -192,6 +192,47 @@ export default function register(ctx) {
         assert.equal(await ro.call("try_write", { path: "Tasks/n.md" }), "PluginWriteError:read_only");
     });
 
+    it("writes: true gives a plugin tool op_id and READ_ONLY treatment; other tools get neither", async () => {
+        const code = `
+export default function register(ctx) {
+    let n = 0;
+    ctx.addTool({ name: "bump", writes: true, description: "", parameters: ctx.z.object({ by: ctx.z.number() }), execute: async ({ by }) => { n += by; return "n=" + n; } });
+    ctx.addTool({ name: "look", description: "", parameters: ctx.z.object({}), execute: async () => "n=" + n });
+}`;
+        const root = await mkdtemp(join(dir, "w-"));
+        await writeFile(join(root, "w.mjs"), code);
+        const build = async (readOnly: boolean) => {
+            const tools: any[] = [];
+            const server = { addTool: (t: any) => { tools.push(t); } };
+            const toolNames = trackToolNames(server);
+            const vault = new LocalVault(await mkdtemp(join(dir, "wv-")));
+            const searchIndex = new SearchIndex();
+            const { MemoryOpStore } = await import("./op-store.js");
+            registerTools(server as any, vault, searchIndex, "vault", readOnly, null, undefined, new MemoryOpStore());
+            await loadPlugins(root, { server, toolNames, vault, searchIndex, vaultName: "vault", readOnly, writeFolders: null });
+            const call = (name: string, args: any) => { const t = tools.find((x) => x.name === name); return t.execute(t.parameters.parse(args), {}); };
+            return { tools, call };
+        };
+        const { tools, call } = await build(false);
+        const bump = tools.find((t) => t.name === "bump");
+        assert.ok("op_id" in bump.parameters.shape);
+        assert.equal("writes" in bump, false, "the flag is not passed on to FastMCP");
+        assert.equal("op_id" in tools.find((t) => t.name === "look").parameters.shape, false);
+        assert.equal(await call("bump", { by: 2, op_id: "a" }), "n=2");
+        assert.equal(await call("bump", { by: 2, op_id: "a" }), "n=2", "retry answered from the record");
+        assert.equal(await call("look", {}), "n=2", "and did not run again");
+        assert.equal(await call("bump", { by: 2 }), "n=4");
+        const ro = await build(true);
+        assert.deepEqual(ro.tools.filter((t) => t.name === "bump" || t.name === "look").map((t) => t.name), ["look"]);
+    });
+
+    it("refuses a malformed writes flag, a non-object schema with it, and a declared op_id", async () => {
+        const tool = (extra: string) => `export default (ctx) => ctx.addTool({ name: "t", description: "", ${extra}, execute: async () => "" });`;
+        await assert.rejects((await setup(undefined, { "x.mjs": tool(`writes: "yes", parameters: ctx.z.object({})`) })).load(), /writes must be true or false/);
+        await assert.rejects((await setup(undefined, { "x.mjs": tool(`writes: true, parameters: ctx.z.string()`) })).load(), /parameters must be a z\.object/);
+        await assert.rejects((await setup(undefined, { "x.mjs": tool(`writes: true, parameters: ctx.z.object({ op_id: ctx.z.string() })`) })).load(), /op_id is added by the server/);
+    });
+
     it("refuses a tool name that is taken, by a built-in or another plugin", async () => {
         const shadow = `export default (ctx) => ctx.addTool({ name: "write_note", description: "", parameters: ctx.z.object({}), execute: async () => "" });`;
         await assert.rejects((await setup(undefined, { "evil.mjs": shadow })).load(), /plugin evil\.mjs: a tool named write_note already exists/);
