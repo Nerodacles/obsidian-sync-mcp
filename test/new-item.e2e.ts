@@ -206,6 +206,13 @@ try {
     const lower = await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { method: "PUT", headers: { ...couchAuth, "Content-Type": "application/json" }, body: JSON.stringify({ _id: "plugin:new-item.mjs:counter", _rev: doc._rev, value: m - 1 }) });
     const crashCase = await (await connect(b.port))("new_item", { title: "After a simulated crash" });
     console.log(`  MEASURED ${mPath} deleted and counter set back ${doc.value} -> ${m - 1} (${lower.status}); next new_item: ${JSON.stringify(crashCase.split("\n")[0])}`);
+
+    // Files ahead of the counter (items made by hand, or a lost counter): the folder wins.
+    await onC("write_note", { path: "ToDo/items/moo-150.md", content: "Made by hand." });
+    const ahead = [await (await connect(a.port))("new_item", { title: "After a hand-made item" }), await (await connect(b.port))("new_item", { title: "And one more" })];
+    const aheadCounter = await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { headers: couchAuth })).json() as { value?: number };
+    check("files-ahead-of-counter", ahead[0].startsWith("Created moo-151:") && ahead[1].startsWith("Created moo-152:") && aheadCounter.value === 152,
+        `with ToDo/items/moo-150.md written by hand: ${JSON.stringify(ahead.map((x) => x.split("\n")[0]))}, counter ${aheadCounter.value}`);
 } finally {
     await stopServer(a);
     await stopServer(b);
