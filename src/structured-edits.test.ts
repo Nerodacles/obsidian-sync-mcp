@@ -282,10 +282,12 @@ describe("set_properties and append_to_section tools", () => {
         }
     });
 
-    it("READ_ONLY: neither is registered", () => {
+    it("READ_ONLY: neither is registered; otherwise both are", () => {
         const names = captureTools({}, null, true).tools.map((t) => t.name);
         assert.ok(!names.includes("set_properties") && !names.includes("append_to_section"));
         assert.ok(names.includes("read_note"));
+        const writable = captureTools({}).tools.map((t) => t.name);
+        assert.ok(writable.includes("set_properties") && writable.includes("append_to_section"));
     });
 
     it("the schema takes text, numbers, booleans and lists of those, and nothing nested", () => {
