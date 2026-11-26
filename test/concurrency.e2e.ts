@@ -34,6 +34,13 @@
  *             on a fresh note each: no round may leave a conflict leaf, every
  *             write must answer "Note saved", and the note must start with one
  *             of the written bodies.
+ *   structured
+ *             STRUCTURED_APPENDS (default 10) append_to_section calls on one
+ *             section and set_properties on three different keys, all at the
+ *             same moment across the instances, for STRUCTURED_ROUNDS rounds
+ *             (default 5) on a fresh note each: every call answers "Note
+ *             edited", every line is in the section exactly once, every
+ *             property has its new value, and no round leaves a conflict leaf.
  *
  * The final note is read straight from CouchDB (not through the servers under
  * test), with its conflict leaves, so a loss hidden in a sibling revision
@@ -348,6 +355,34 @@ async function editVsWrite(clients: Client[]): Promise<void> {
         (problems.length ? `; ${problems.join("; ")}` : ""));
 }
 
+async function structured(clients: Client[]): Promise<void> {
+    const rounds = Number(process.env.STRUCTURED_ROUNDS ?? 5);
+    const appends = Number(process.env.STRUCTURED_APPENDS ?? 10);
+    const props = { state: "done", priority: 3, owner: "Ana" };
+    let leaves = 0;
+    const problems: string[] = [];
+    for (let r = 0; r < rounds; r++) {
+        const path = `Projects/Garden plan ${r}.md`;
+        await seed(clients[0], path, "---\n# kept as written\nstate: open\npriority: 1\nowner: 'Bo'\n---\n# Garden plan\n\n## Log\n- seeded\n\n## Next\n- water\n");
+        const workers = await Promise.all(Array.from({ length: appends + 3 }, (_, i) => new Client(clients[i % clients.length].port).connect()));
+        const answers = await Promise.all(workers.map((w, i) => i < appends
+            ? w.tool("append_to_section", { path, heading: "Log", line: `- r${r}-line-${i}` })
+            : w.tool("set_properties", { path, set: Object.fromEntries([Object.entries(props)[i - appends]]) })));
+        const { winner, conflicts } = await readFromCouch(path);
+        leaves += conflicts.length;
+        const bad = answers.filter((a) => !a.startsWith("Note edited"));
+        if (bad.length) problems.push(`round ${r}: ${bad.length} answers ${JSON.stringify([...new Set(bad.map((a) => a.split("\n")[0].replace(path, "<path>")))])}`);
+        const section = winner.slice(winner.indexOf("## Log\n"), winner.indexOf("## Next\n"));
+        const missing = Array.from({ length: appends }, (_, i) => `- r${r}-line-${i}\n`).filter((l) => section.split(l).length !== 2 || winner.split(l).length !== 2);
+        if (missing.length) problems.push(`round ${r}: ${missing.length}/${appends} lines missing, doubled or outside the section`);
+        const fm = "---\n# kept as written\nstate: done\npriority: 3\nowner: Ana\n---\n";
+        if (!winner.startsWith(fm)) problems.push(`round ${r} frontmatter: ${JSON.stringify(winner.slice(0, winner.indexOf("# Garden")))}`);
+    }
+    check("structured", leaves === 0 && problems.length === 0,
+        `${rounds} rounds of ${appends} append_to_section + 3 set_properties at once: ${leaves} conflict leaves` +
+        (problems.length ? `; ${problems.join("; ")}` : ""));
+}
+
 /** Server-side retry rounds, from the debug log line the CouchDB backend writes for each. */
 function retriesLogged(servers: Server[]): number {
     return servers.reduce((n, s) => n + (s.logs.match(/revision conflict on attempt/g)?.length ?? 0), 0);
@@ -377,6 +412,7 @@ try {
         await groupWithRefusal(clients);
         await expectedRevision(clients);
         await editVsWrite(clients);
+        await structured(clients);
     }
 } finally {
     if (process.env.CONCURRENCY_SERVER_LOGS) {

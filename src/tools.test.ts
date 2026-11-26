@@ -647,7 +647,7 @@ describe("op_id (idempotent writes)", () => {
         try {
             for (const t of tools) {
                 const has = "op_id" in t.parameters.shape;
-                assert.equal(has, ["write_note", "edit_note", "delete_note", "move_note", "rename_note", "resolve_conflict"].includes(t.name), t.name);
+                assert.equal(has, ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "rename_note", "resolve_conflict"].includes(t.name), t.name);
             }
             const edit = tools.find((t) => t.name === "edit_note");
             assert.equal(edit.parameters.safeParse({ path: "a.md", content: "x", op_id: "has space" }).success, false);
