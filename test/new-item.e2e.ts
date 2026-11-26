@@ -139,7 +139,10 @@ for (const db of [DB, OPS_DB]) {
 
 // --- new_item across two instances ---
 const scoped = { WRITE_FOLDERS: "ToDo:create+update" };
-const a = await startServer(9901, scoped, true);
+const ZONE = "America/Santo_Domingo";
+const COUNTER = "plugin:new-item.mjs:counter";
+const counter = async () => (await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent(COUNTER)}`, { headers: couchAuth })).json()) as { value: number; _rev: string };
+const a = await startServer(9901, { ...scoped, NEW_ITEM_TIMEZONE: ZONE }, true);
 const b = await startServer(9902, scoped, true);
 // An unrestricted instance without the plugin, for setup and inspection only.
 const c = await startServer(9903, {}, false);
@@ -160,18 +163,32 @@ try {
     const ids = answers.map((x) => x.text.match(/^Created (moo-\d+):/)?.[1] ?? null);
     const created = ids.filter((x): x is string => x !== null);
     const numbers = created.map((x) => Number(x.slice(4))).sort((p, q) => p - q);
-    const skipped = answers.flatMap((x) => (x.text.match(/^Taken by other callers first: (.*)\.$/m)?.[1] ?? "").split(", ").filter(Boolean));
+    const unused = (text: string) => (text.match(/^Reserved but already taken, left unused: (.*)\.$/m)?.[1] ?? "").split(", ").filter(Boolean).map((x) => Number(x.slice(4)));
+    const reported = answers.flatMap((x) => unused(x.text));
     for (const x of answers) console.log(`  caller ${String(x.i).padStart(2)} on ${x.i % 2 === 0 ? "A" : "B"} ${String(x.ms).padStart(5)} ms: ${x.text.split("\n").filter((l) => !l.startsWith("[Open")).join(" | ")}`);
-    console.log(`  wall ${wall} ms; ${skipped.length} refused create attempts in total`);
+    const counterDoc = await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent(COUNTER)}`, { headers: couchAuth })).json() as { value?: number; _rev?: string };
+    const reservations = Number(counterDoc._rev?.split("-")[0]);
+    console.log(`  wall ${wall} ms; ${reservations} successful reservations (counter revision generation); ${reported.length} reserved numbers reported unused`);
     check("all-created", created.length === CALLS, `${created.length}/${CALLS} answers say Created`);
     check("distinct-ids", new Set(created).size === CALLS, `${new Set(created).size} distinct ids: ${numbers.join(",")}`);
     const max = numbers.at(-1) ?? 0;
     const gaps = Array.from({ length: max }, (_, k) => k + 1).filter((n) => !numbers.includes(n));
-    check("no-gaps", gaps.length === 0, `highest ${max}; numbers 1..${max} not created: ${gaps.length ? gaps.join(",") : "none"}`);
+    // A gap is allowed only as a reservation whose create was refused, and every such answer names it.
+    check("gaps-explained", JSON.stringify(gaps) === JSON.stringify([...reported].sort((p, q) => p - q)) && reservations === CALLS + reported.length,
+        `highest ${max}; numbers 1..${max} not created: ${gaps.length ? gaps.join(",") : "none"}; reported unused: ${reported.length ? reported.join(",") : "none"}; reservations ${reservations} = ${CALLS} created + ${reported.length} unused`);
 
-    const listing = await onC("list_notes", { folder: "ToDo/items" });
-    const itemLines = listing.split("\n").filter((l) => /moo-\d+\.md/.test(l));
-    check("notes-in-vault", itemLines.length === CALLS, `list_notes shows ${itemLines.length} item notes`);
+    // Read straight from CouchDB by path: list_notes answers from C's index, which can lag behind A and B.
+    const itemPathOf = (n: number) => `ToDo/items/moo-${String(n).padStart(3, "0")}.md`;
+    const readItems = async (from: number, to: number) => {
+        const found: Array<{ n: number; body: string }> = [];
+        for (let n = from; n <= to; n++) {
+            const body = await onC("read_note", { path: itemPathOf(n) });
+            if (!body.startsWith("Note not found")) found.push({ n, body });
+        }
+        return found;
+    };
+    const stored = await readItems(1, max + 5);
+    check("notes-in-vault", stored.length === CALLS && stored.every((x) => numbers.includes(x.n)), `${stored.length} item notes found reading moo-001..moo-${String(max + 5).padStart(3, "0")} by path`);
     // Every note holds its own caller's fields: no create replaced another's note.
     let intact = 0;
     for (const x of answers) {
@@ -181,38 +198,66 @@ try {
         if (body.includes(`caller: ${x.i}\n`) && body.includes(`# ${id} Concurrent item ${x.i}\n`) && body.includes(`id: ${id}\n`)) intact++;
     }
     check("notes-intact", intact === CALLS, `${intact}/${CALLS} notes carry their caller's title and fields`);
-
-    const counterDoc = await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { headers: couchAuth })).json() as { value?: number; _rev?: string };
     check("counter-is-highest", counterDoc.value === max, `counter ${counterDoc.value} (rev ${counterDoc._rev}), highest id ${max}`);
 
-    // A deleted item's number is not handed out again: the counter remembers it.
-    const last = `ToDo/items/moo-${String(max).padStart(3, "0")}.md`;
-    const del = await onC("delete_note", { path: last });
-    const afterDelete = await (await connect(a.port))("new_item", { title: "After a delete" });
-    check("deleted-number-not-reused", afterDelete.startsWith(`Created moo-${String(max + 1).padStart(3, "0")}:`),
-        `delete_note ${last}: ${JSON.stringify(del.split("\n")[0])}; next new_item: ${JSON.stringify(afterDelete.split("\n")[0])}`);
-
-    // Measured limit: the server's create-only write re-creates a deleted path.
-    const recreate = await onC("write_note", { path: last, content: "probe", create_only: true });
-    console.log(`  MEASURED create_only on the deleted ${last}: ${JSON.stringify(recreate.split("\n")[0])}`);
-    await onC("delete_note", { path: last });
-
-    // Measured limit: the crash window. Item M created, its counter raise lost
-    // (simulated by putting the counter back to M-1), then M deleted: M comes back.
+    // The old reuse case. Before, an item was created first and the counter raised
+    // after, so a lost raise followed by a delete handed the number out again. Now
+    // the counter already holds the number when the call answers, and a delete
+    // can't bring it back.
     const m = max + 1;
-    const mPath = `ToDo/items/moo-${String(m).padStart(3, "0")}.md`;
-    await onC("delete_note", { path: mPath });
-    const doc = await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { headers: couchAuth })).json() as { _rev: string; value: number };
-    const lower = await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { method: "PUT", headers: { ...couchAuth, "Content-Type": "application/json" }, body: JSON.stringify({ _id: "plugin:new-item.mjs:counter", _rev: doc._rev, value: m - 1 }) });
-    const crashCase = await (await connect(b.port))("new_item", { title: "After a simulated crash" });
-    console.log(`  MEASURED ${mPath} deleted and counter set back ${doc.value} -> ${m - 1} (${lower.status}); next new_item: ${JSON.stringify(crashCase.split("\n")[0])}`);
+    const mId = `moo-${String(m).padStart(3, "0")}`;
+    const made = await (await connect(a.port))("new_item", { title: "To be deleted" });
+    const atAnswer = await counter();
+    const del = await onC("delete_note", { path: `ToDo/items/${mId}.md` });
+    const afterDelete = await (await connect(b.port))("new_item", { title: "After a delete" });
+    check("deleted-number-not-reused", made.startsWith(`Created ${mId}:`) && atAnswer.value === m && afterDelete.startsWith(`Created moo-${String(m + 1).padStart(3, "0")}:`),
+        `${JSON.stringify(made.split("\n")[0])}, counter ${atAnswer.value} when it answered; delete_note: ${JSON.stringify(del.split("\n")[0])}; next new_item: ${JSON.stringify(afterDelete.split("\n")[0])}`);
+    const recreate = await onC("write_note", { path: `ToDo/items/${mId}.md`, content: "probe", create_only: true });
+    console.log(`  MEASURED create_only on the deleted ToDo/items/${mId}.md: ${JSON.stringify(recreate.split("\n")[0])} (why the counter, not the vault, must remember it)`);
+    await onC("delete_note", { path: `ToDo/items/${mId}.md` });
+
+    // A crash between reserving and creating (simulated: the counter raised with no note) leaves a gap.
+    const before = await counter();
+    const crashed = before.value + 1;
+    const reserve = await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent(COUNTER)}`, { method: "PUT", headers: { ...couchAuth, "Content-Type": "application/json" }, body: JSON.stringify({ _id: COUNTER, _rev: before._rev, value: crashed }) });
+    const afterCrash = await (await connect(a.port))("new_item", { title: "After a crash" });
+    const crashedPath = `ToDo/items/moo-${String(crashed).padStart(3, "0")}.md`;
+    const gapNote = await onC("read_note", { path: crashedPath });
+    check("crash-leaves-gap", reserve.status === 201 && afterCrash.startsWith(`Created moo-${String(crashed + 1).padStart(3, "0")}:`) && gapNote.startsWith("Note not found"),
+        `counter ${before.value} -> ${crashed} with no note (${reserve.status}); next new_item: ${JSON.stringify(afterCrash.split("\n")[0])}; ${crashedPath}: ${JSON.stringify(gapNote.split("\n")[0])}`);
 
     // Files ahead of the counter (items made by hand, or a lost counter): the folder wins.
     await onC("write_note", { path: "ToDo/items/moo-150.md", content: "Made by hand." });
     const ahead = [await (await connect(a.port))("new_item", { title: "After a hand-made item" }), await (await connect(b.port))("new_item", { title: "And one more" })];
-    const aheadCounter = await (await fetch(`${COUCH}/${OPS_DB}/${encodeURIComponent("plugin:new-item.mjs:counter")}`, { headers: couchAuth })).json() as { value?: number };
+    const aheadCounter = await counter();
     check("files-ahead-of-counter", ahead[0].startsWith("Created moo-151:") && ahead[1].startsWith("Created moo-152:") && aheadCounter.value === 152,
         `with ToDo/items/moo-150.md written by hand: ${JSON.stringify(ahead.map((x) => x.split("\n")[0]))}, counter ${aheadCounter.value}`);
+
+    // op_id: a retry with the same op_id creates nothing, on either instance.
+    const args = { title: "Retried after a timeout", op_id: "retry-item-1" };
+    const firstTry = await (await connect(a.port))("new_item", args);
+    const retryA = await (await connect(a.port))("new_item", args);
+    const retryB = await (await connect(b.port))("new_item", args);
+    // Every item note from 150 up, read by path, so a duplicate can't hide behind index lag.
+    const countTitle = async (title: string) => (await readItems(150, 175)).filter((x) => x.body.includes(`title: ${JSON.stringify(title)}\n`)).length;
+    const named = (await readItems(150, 175)).length;
+    const onceCount = await countTitle(args.title);
+    check("op-id-sequential", firstTry.startsWith("Created moo-153:") && retryA === firstTry && retryB === firstTry && onceCount === 1 && (await counter()).value === 153,
+        `first ${JSON.stringify(firstTry.split("\n")[0])}; retry on A same: ${retryA === firstTry}; retry on B same: ${retryB === firstTry}; notes with that title: ${onceCount}; item notes from 150 up: ${named}`);
+    const both = { title: "Sent to both at once", op_id: "retry-item-2" };
+    const simultaneous = await Promise.all([(await connect(a.port))("new_item", both), (await connect(b.port))("new_item", both)]);
+    const bothCount = await countTitle(both.title);
+    const settled = await (await connect(b.port))("new_item", both);
+    check("op-id-simultaneous", bothCount === 1 && simultaneous.filter((x) => x.startsWith("Created")).length >= 1 && settled.startsWith("Created moo-154:"),
+        `answers ${JSON.stringify(simultaneous.map((x) => x.split("\n")[0].slice(0, 90)))}; notes with that title: ${bothCount}; later retry: ${JSON.stringify(settled.split("\n")[0])}`);
+    const reused = await (await connect(b.port))("new_item", { ...args, title: "Different" });
+    check("op-id-other-arguments", /already used for a different call/.test(reused) && (await counter()).value === 154, `same op_id, other title: ${JSON.stringify(reused.split("\n")[0].slice(0, 90))}`);
+
+    // created in the zone NEW_ITEM_TIMEZONE names (instance A).
+    const zoned = await onC("read_note", { path: "ToDo/items/moo-153.md" });
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    check("created-in-zone", zoned.includes(`\ncreated: ${today}\n`) && /created dates in America\/Santo_Domingo \(NEW_ITEM_TIMEZONE\)/.test(a.logs),
+        `moo-153 (instance A, ${ZONE}): ${zoned.match(/created: \S+/)?.[0]}; expected ${today}`);
 } finally {
     await stopServer(a);
     await stopServer(b);
