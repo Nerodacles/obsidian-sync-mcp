@@ -18,6 +18,7 @@ import { redactCredentials, describeError, describeLogMessage } from "./redact.j
 import { parsePathNormalization, type PathNormalizationSetting } from "./path-identity-config.js";
 import { declareUtf8Charset } from "./http-charset.js";
 import { CouchOpStore } from "./op-store.js";
+import { CouchDocStore } from "./plugin-store.js";
 import { loadPlugins, trackToolNames } from "./plugins.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
@@ -552,8 +553,10 @@ if (ATTACHMENTS_ENABLED) {
 
 if (PLUGIN_DIR) {
     try {
-        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS });
-        console.log(`Plugins from ${PLUGIN_DIR}: ${loaded.length ? loaded.join(", ") : "none found"}.`);
+        // ctx.store shares OPS_DATABASE (and its checks above) with the op_id records.
+        const store = opStore ? new CouchDocStore(COUCHDB_URL!, OPS_DATABASE!, COUCHDB_USER, COUCHDB_PASSWORD!) : undefined;
+        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS, store });
+        console.log(`Plugins from ${PLUGIN_DIR}: ${loaded.length ? loaded.join(", ") : "none found"}${loaded.length ? (store ? "; ctx.store in " + OPS_DATABASE : "; no ctx.store (needs OPS_DATABASE)") : ""}.`);
     } catch (err) {
         console.error(`PLUGIN_DIR: ${(err as Error).message}`);
         process.exit(1);

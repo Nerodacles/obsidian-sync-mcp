@@ -10,6 +10,11 @@
  * same create-only and edit semantics as write_note and edit_note), and keeps
  * the search index current.
  *
+ * State: when OPS_DATABASE is set (CouchDB mode, not READ_ONLY), `ctx.store`
+ * is a small revision-checked key/value store shared by every instance on the
+ * vault, its keys namespaced by the plugin's file name (see plugin-store.ts).
+ * Without OPS_DATABASE `ctx.store` is absent, so a plugin can check for it.
+ *
  * Trust: a plugin runs in this process with this process's rights. The
  * context gives it no way around the checks above, but nothing stops a
  * plugin's own code from importing anything it likes; install only plugins
@@ -26,10 +31,14 @@ import type { SearchIndex } from "./search.js";
 import { checkWrite, type WriteScope } from "./write-scope.js";
 import { chooseWriteMode, editNoteText, NO_REVISIONS_MESSAGE } from "./tools.js";
 import { READ_ONLY_MESSAGE } from "./vault-readonly.js";
+import { scopedStore, type DocStore, type PluginStore } from "./plugin-store.js";
+
+/** Why a plugin write was refused, for a plugin that reacts to it (e.g. picks another path on "exists"). */
+export type PluginWriteErrorCode = "read_only" | "denied" | "exists" | "not_found" | "revision_mismatch" | "unsupported" | "failed";
 
 /** A write a plugin asked for was refused; the message is meant for the agent. */
 export class PluginWriteError extends Error {
-    constructor(message: string) {
+    constructor(message: string, readonly code: PluginWriteErrorCode = "failed") {
         super(message);
         this.name = "PluginWriteError";
     }
@@ -67,6 +76,8 @@ export interface PluginContext {
     /** The zod the server uses, for tool parameters. */
     z: typeof z;
     vault: PluginVault;
+    /** Present only when OPS_DATABASE is set; see plugin-store.ts. */
+    store?: PluginStore;
     addTool(tool: PluginTool): void;
     log(message: string): void;
 }
@@ -93,9 +104,11 @@ export function trackToolNames(server: ToolServer): Set<string> {
 /** The vault as a plugin sees it: every write passes the same checks as the built-in tools. */
 export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writeFolders: WriteScope, readOnly: boolean): PluginVault {
     const deny = (message: string | null) => {
-        if (message) throw new PluginWriteError(message);
+        if (message) throw new PluginWriteError(message, "denied");
     };
-    const writable = () => deny(readOnly ? READ_ONLY_MESSAGE : null);
+    const writable = () => {
+        if (readOnly) throw new PluginWriteError(READ_ONLY_MESSAGE, "read_only");
+    };
     return {
         readNote: (path) => vault.readNote(path),
         getMetadata: (path) => vault.getMetadata(path),
@@ -104,27 +117,30 @@ export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writ
         async writeNote(path, content, { createOnly = false, expectedRevision } = {}) {
             writable();
             if (expectedRevision !== undefined) {
-                if (createOnly) throw new PluginWriteError("expectedRevision names an existing note, so it can't be combined with createOnly.");
+                if (createOnly) throw new PluginWriteError("expectedRevision names an existing note, so it can't be combined with createOnly.", "unsupported");
                 deny(checkWrite(path, "update", writeFolders));
-                if (!vault.updateNote) throw new PluginWriteError(NO_REVISIONS_MESSAGE);
+                if (!vault.updateNote) throw new PluginWriteError(NO_REVISIONS_MESSAGE, "unsupported");
                 try {
                     await vault.updateNote(path, () => content, { expectedRevision });
                 } catch (err) {
-                    if (err instanceof RevisionMismatchError) throw new PluginWriteError(err.message);
-                    if (err instanceof NoteNotFoundError) throw new PluginWriteError(`Note not found: ${path}`);
+                    if (err instanceof RevisionMismatchError) throw new PluginWriteError(err.message, "revision_mismatch");
+                    if (err instanceof NoteNotFoundError) throw new PluginWriteError(`Note not found: ${path}`, "not_found");
                     throw err;
                 }
                 searchIndex.update(path, content, Date.now());
                 return;
             }
             const choice = createOnly ? { mode: "create" as const } : chooseWriteMode(path, writeFolders);
-            if ("denied" in choice) throw new PluginWriteError(choice.denied);
+            if ("denied" in choice) throw new PluginWriteError(choice.denied, "denied");
             if (createOnly) deny(checkWrite(path, "create", writeFolders));
             try {
                 if (!(await vault.writeNote(path, content, { mode: choice.mode }))) throw new PluginWriteError(`Failed to write note: ${path}`);
             } catch (err) {
-                if (err instanceof NoteExistsError) throw new PluginWriteError(`Note already exists: ${path}`);
-                if (err instanceof NoteNotFoundError) throw new PluginWriteError(checkWrite(path, "create", writeFolders) ?? `Note not found: ${path}`);
+                if (err instanceof NoteExistsError) throw new PluginWriteError(`Note already exists: ${path}`, "exists");
+                if (err instanceof NoteNotFoundError) {
+                    const denied = checkWrite(path, "create", writeFolders);
+                    throw new PluginWriteError(denied ?? `Note not found: ${path}`, denied ? "denied" : "not_found");
+                }
                 throw err;
             }
             searchIndex.update(path, content, Date.now());
@@ -133,14 +149,14 @@ export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writ
             writable();
             deny(checkWrite(path, "update", writeFolders));
             const updated = await editNoteText(vault, path, apply);
-            if (updated === null) throw new PluginWriteError(`Note not found: ${path}`);
+            if (updated === null) throw new PluginWriteError(`Note not found: ${path}`, "not_found");
             searchIndex.update(path, updated, Date.now());
             return updated;
         },
         async deleteNote(path) {
             writable();
             deny(checkWrite(path, "delete", writeFolders));
-            if ((await vault.readNote(path)) === null) throw new PluginWriteError(`Note not found: ${path}`);
+            if ((await vault.readNote(path)) === null) throw new PluginWriteError(`Note not found: ${path}`, "not_found");
             if (!(await vault.deleteNote(path))) throw new PluginWriteError(`Failed to delete: ${path}`);
             searchIndex.remove(path);
         },
@@ -151,7 +167,7 @@ export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writ
             try {
                 if (!(await vault.moveNote(from, to))) throw new PluginWriteError(`Failed to move: ${from} → ${to}`);
             } catch (err) {
-                if (err instanceof NoteExistsError) throw new PluginWriteError(`A note already exists at ${to}.`);
+                if (err instanceof NoteExistsError) throw new PluginWriteError(`A note already exists at ${to}.`, "exists");
                 throw err;
             }
             searchIndex.remove(from);
@@ -168,6 +184,8 @@ export interface LoadOptions {
     vaultName: string;
     readOnly: boolean;
     writeFolders: WriteScope;
+    /** OPS_DATABASE's documents; each plugin gets its own namespaced `ctx.store` on it. Absent: no `ctx.store`. */
+    store?: DocStore;
 }
 
 /** Load every plugin in `dir`. Throws, naming the file, on the first one that fails. Returns the files loaded. */
@@ -192,6 +210,7 @@ export async function loadPlugins(dir: string, options: LoadOptions): Promise<st
             readOnly: options.readOnly,
             z,
             vault,
+            ...(options.store ? { store: scopedStore(options.store, file) } : {}),
             log: (message) => console.log(`[${file}] ${message}`),
             addTool: (tool) => {
                 if (!tool || typeof tool.name !== "string" || !TOOL_NAME.test(tool.name)) {

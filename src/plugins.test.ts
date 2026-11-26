@@ -9,6 +9,7 @@ import { parseWriteFolders } from "./write-scope.js";
 import { readOnlyVault, READ_ONLY_MESSAGE } from "./vault-readonly.js";
 import { registerTools } from "./tools.js";
 import { loadPlugins, trackToolNames } from "./plugins.js";
+import { MemoryDocStore } from "./plugin-store.js";
 
 // The example plugin: one tool per vault call, so every guard can be reached from a tool.
 const EXAMPLE = `
@@ -62,7 +63,7 @@ describe("plugins", () => {
     before(async () => { dir = await mkdtemp(join(tmpdir(), "plugins-")); });
     after(async () => { await rm(dir, { recursive: true, force: true }); });
 
-    async function setup(scope: string | undefined, plugins: Record<string, string>, readOnly = false) {
+    async function setup(scope: string | undefined, plugins: Record<string, string>, readOnly = false, store?: MemoryDocStore) {
         const root = await mkdtemp(join(dir, "v-"));
         const pluginDir = await mkdtemp(join(dir, "p-"));
         for (const [name, code] of Object.entries(plugins)) await writeFile(join(pluginDir, name), code);
@@ -77,7 +78,7 @@ describe("plugins", () => {
         const searchIndex = new SearchIndex();
         const writeFolders = parseWriteFolders(scope);
         registerTools(server as any, vault, searchIndex, "vault", readOnly, writeFolders);
-        const load = () => loadPlugins(pluginDir, { server, toolNames, vault, searchIndex, vaultName: "vault", readOnly, writeFolders });
+        const load = () => loadPlugins(pluginDir, { server, toolNames, vault, searchIndex, vaultName: "vault", readOnly, writeFolders, store });
         const call = (name: string, args: any): Promise<string> => {
             const tool = tools.find((t) => t.name === name);
             return tool.execute(tool.parameters.parse(args), {});
@@ -141,6 +142,54 @@ describe("plugins", () => {
             // Local mode has no revisions, so no readNoteRevision.
             vault: ["deleteNote", "editNote", "getMetadata", "listNotes", "moveNote", "readNote", "writeNote"],
         });
+    });
+
+    it("with OPS_DATABASE the context adds store, namespaced per plugin file", async () => {
+        const counter = (name: string) => `
+export default function register(ctx) {
+    ctx.addTool({
+        name: "${name}",
+        description: "Count.",
+        parameters: ctx.z.object({}),
+        execute: async () => {
+            const cur = await ctx.store.get("n");
+            const res = await ctx.store.put("n", (cur?.value ?? 0) + 1, cur?.revision ?? null);
+            return res.conflict ? "conflict" : String((cur?.value ?? 0) + 1);
+        },
+    });
+    ctx.addTool({ name: "${name}_keys", description: "", parameters: ctx.z.object({}), execute: async () => JSON.stringify({ ctx: Object.keys(ctx).sort(), store: Object.keys(ctx.store).sort() }) });
+}`;
+        const docs = new MemoryDocStore();
+        const { load, call } = await setup(undefined, { "one.mjs": counter("one"), "two.mjs": counter("two") }, false, docs);
+        await load();
+        assert.deepEqual(JSON.parse(await call("one_keys", {})), { ctx: ["addTool", "log", "readOnly", "store", "vault", "vaultName", "z"], store: ["get", "put"] });
+        assert.equal(await call("one", {}), "1");
+        assert.equal(await call("one", {}), "2");
+        assert.equal(await call("two", {}), "1");
+        assert.deepEqual([...docs.docs.entries()].map(([id, d]) => [id, d.value]).sort(), [["plugin:one.mjs:n", 2], ["plugin:two.mjs:n", 1]]);
+    });
+
+    it("a refused write carries a code a plugin can act on", async () => {
+        const probe = `
+export default function register(ctx) {
+    ctx.addTool({
+        name: "try_write",
+        description: "",
+        parameters: ctx.z.object({ path: ctx.z.string(), createOnly: ctx.z.boolean().optional() }),
+        execute: async ({ path, createOnly }) => {
+            try { await ctx.vault.writeNote(path, "x", { createOnly }); return "ok"; }
+            catch (err) { return err.name + ":" + err.code; }
+        },
+    });
+}`;
+        const { load, call } = await setup("Tasks:create", { "probe.mjs": probe });
+        await load();
+        assert.equal(await call("try_write", { path: "Tasks/list.md", createOnly: true }), "PluginWriteError:exists");
+        assert.equal(await call("try_write", { path: "Archive/x.md", createOnly: true }), "PluginWriteError:denied");
+        assert.equal(await call("try_write", { path: "Tasks/fresh.md", createOnly: true }), "ok");
+        const ro = await setup(undefined, { "probe.mjs": probe }, true);
+        await ro.load();
+        assert.equal(await ro.call("try_write", { path: "Tasks/n.md" }), "PluginWriteError:read_only");
     });
 
     it("refuses a tool name that is taken, by a built-in or another plugin", async () => {
