@@ -235,7 +235,10 @@ export function registerTools(
     const writeScopeNote = describeWriteScope(writeFolders);
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
-        if (!readOnly && (WRITE_TOOLS as readonly string[]).includes(tool.name)) {
+        // A plugin tool marked `writes: true` is treated like a built-in write tool.
+        const pluginWrite = tool.writes === true;
+        delete tool.writes;
+        if (!readOnly && (pluginWrite || (WRITE_TOOLS as readonly string[]).includes(tool.name))) {
             tool.parameters = tool.parameters.extend({ op_id: opIdParam });
             const write = tool.execute;
             tool.execute = async (args: any, ctx: any) => {

@@ -15,6 +15,11 @@
  * vault, its keys namespaced by the plugin's file name (see plugin-store.ts).
  * Without OPS_DATABASE `ctx.store` is absent, so a plugin can check for it.
  *
+ * Writes and op_id: a tool added with `writes: true` is handled like the
+ * built-in write tools: with OPS_DATABASE it takes `op_id` through the same
+ * wrapper (records in the same database, keyed by tool name and arguments),
+ * and READ_ONLY leaves it out. Tools without it get no `op_id`.
+ *
  * Trust: a plugin runs in this process with this process's rights. The
  * context gives it no way around the checks above, but nothing stops a
  * plugin's own code from importing anything it likes; install only plugins
@@ -66,6 +71,13 @@ export interface PluginVault {
 export interface PluginTool {
     name: string;
     description: string;
+    /**
+     * The tool writes: it gets the built-in write tools' treatment. With
+     * OPS_DATABASE it takes `op_id` (a retry with the same id returns the first
+     * answer without running again), and READ_ONLY leaves it out. Needs a
+     * `z.object` for parameters, and must not declare `op_id` itself.
+     */
+    writes?: boolean;
     parameters: z.ZodType;
     execute: (args: any, ctx: any) => Promise<unknown>;
 }
@@ -218,6 +230,16 @@ export async function loadPlugins(dir: string, options: LoadOptions): Promise<st
                 }
                 if (options.toolNames.has(tool.name)) throw new Error(`${where}: a tool named ${tool.name} already exists.`);
                 if (typeof tool.execute !== "function" || !tool.parameters) throw new Error(`${where}: tool ${tool.name} needs parameters and execute.`);
+                if (tool.writes !== undefined && typeof tool.writes !== "boolean") throw new Error(`${where}: tool ${tool.name}: writes must be true or false.`);
+                if (tool.writes) {
+                    const shape = (tool.parameters as { shape?: Record<string, unknown> }).shape;
+                    if (!shape || typeof (tool.parameters as { extend?: unknown }).extend !== "function") throw new Error(`${where}: tool ${tool.name} has writes: true, so its parameters must be a z.object.`);
+                    if ("op_id" in shape) throw new Error(`${where}: tool ${tool.name} has writes: true, so op_id is added by the server; don't declare it.`);
+                    if (options.readOnly) {
+                        console.log(`[${file}] READ_ONLY: write tool ${tool.name} not registered.`);
+                        return;
+                    }
+                }
                 const execute = tool.execute;
                 options.server.addTool({
                     ...tool,
