@@ -246,7 +246,7 @@ export default function register(ctx) {
 
 A refused write throws a `PluginWriteError` whose `code` says why: `exists` (a create-only write found a note there), `denied` (`WRITE_FOLDERS`), `read_only`, `not_found`, `revision_mismatch`, `unsupported` or `failed`. A plugin that doesn't catch it returns its message to the agent; one that does can react, for example by trying another path on `exists`.
 
-Plugin tools don't take `op_id`: the server's operation records cover its built-in write tools only.
+A tool added with `writes: true` is treated like the built-in write tools: with `OPS_DATABASE` it takes `op_id` (a retry with the same id and arguments returns the first answer without running again, on any instance), and `READ_ONLY` leaves it out. Its parameters must be a `z.object` that doesn't declare `op_id` itself. Tools without the flag take no `op_id`.
 
 **`ctx.store` (with `OPS_DATABASE`).** A plugin that needs state shared by every server instance on the vault (a counter, a marker) gets a small key/value store, kept in the `OPS_DATABASE` database next to the `op_id` records and never synced to Obsidian. It is present only when `OPS_DATABASE` is set and the server isn't `READ_ONLY`; otherwise `ctx.store` is `undefined`, so check before using it.
 
@@ -261,7 +261,7 @@ if (res.conflict) { /* someone else wrote first: res.current is what is there no
 - Keys are 1-128 characters of `A-Z a-z 0-9 . _ -`. Each plugin file has its own keys (stored as `plugin:<file name>:<key>`), so two plugins can't see or overwrite each other's. Values are JSON, at most 64 KiB; a value that isn't JSON (a `Date`, a `Map`) is stored as `JSON.stringify` makes it.
 - A CouchDB failure other than a conflict (credentials, the database unreachable) throws; it is never reported as a conflict. There is no delete.
 
-[`examples/new-item.mjs`](examples/new-item.mjs) uses both: it creates numbered notes (`<folder>/<prefix>-NNN.md`) whose numbers stay unique across instances, from a counter in `ctx.store` and create-only writes that move to the next number on `exists`. `npm run test:new-item` runs it on two instances against a throwaway CouchDB.
+[`examples/new-item.mjs`](examples/new-item.mjs) uses all of this: it creates numbered notes (`<folder>/<prefix>-NNN.md`) whose numbers stay unique across instances and are never handed out twice. It reserves each number in a `ctx.store` counter by compare-and-swap before creating the note create-only, so a refused create or a crash leaves a gap, never a reused number; it is a `writes: true` tool, so retries with an `op_id` are safe; and it dates notes in `NEW_ITEM_TIMEZONE`, else `DISPLAY_TIMEZONE`, else UTC. `npm run test:new-item` runs it on two instances against a throwaway CouchDB.
 
 ### Retries without duplicates (`op_id`, opt-in)
 
