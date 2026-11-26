@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalVault } from "./vault-local.js";
@@ -83,7 +83,7 @@ describe("plugins", () => {
             const tool = tools.find((t) => t.name === name);
             return tool.execute(tool.parameters.parse(args), {});
         };
-        return { local, load, call, tools, searchIndex };
+        return { local, load, call, tools, searchIndex, pluginDir };
     }
 
     it("loads a plugin's tools, which use the vault", async () => {
@@ -250,6 +250,24 @@ export default function register(ctx) {
         const { load, tools } = await setup(undefined, { "notes.txt": "not a plugin", "tasks.mjs": EXAMPLE });
         assert.deepEqual(await load(), ["tasks.mjs"]);
         assert.ok(tools.some((t) => t.name === "add_task"));
+    });
+
+    it("loads a plugin presented as a symlink, as a ConfigMap volume mounts it, and skips a linked directory", async () => {
+        const { load, tools, pluginDir } = await setup(undefined, {});
+        const data = join(pluginDir, "..data");
+        await mkdir(data);
+        await writeFile(join(data, "tasks.mjs"), EXAMPLE);
+        await symlink(join(data, "tasks.mjs"), join(pluginDir, "tasks.mjs"));
+        await mkdir(join(dir, "linked-dir.mjs"), { recursive: true });
+        await symlink(join(dir, "linked-dir.mjs"), join(pluginDir, "dir.mjs"));
+        assert.deepEqual(await load(), ["tasks.mjs"]);
+        assert.ok(tools.some((t) => t.name === "add_task"));
+    });
+
+    it("stops on a plugin symlink that points at nothing", async () => {
+        const { load, pluginDir } = await setup(undefined, {});
+        await symlink(join(pluginDir, "missing.mjs"), join(pluginDir, "gone.mjs"));
+        await assert.rejects(load(), /plugin gone\.mjs is a symlink to nothing/);
     });
 });
 
