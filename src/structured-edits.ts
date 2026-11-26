@@ -109,19 +109,21 @@ export function setProperties(content: string, set: Record<string, PropertyValue
         // After the key, so the key keeps its spelling and quoting.
         splices.push({ start: keyNode.range![1], end: valueEnd(yaml, pair), text: valueText(value, lineIndent(yaml, keyNode.range![0]), eol) });
     }
-    for (const key of remove) {
+    let removedLastLine = false;
+    for (const key of new Set(remove)) {
         const pair = pairs.find((p) => keyName(p, yaml) === key);
         if (!pair) continue;
-        let start = yaml.lastIndexOf("\n", (pair.key as Node).range![0] - 1) + 1;
+        // Whole lines: from the key's line to the end of its value's last line.
+        const start = yaml.lastIndexOf("\n", (pair.key as Node).range![0] - 1) + 1;
         const newline = yaml.indexOf("\n", valueEnd(yaml, pair));
-        let end = newline === -1 ? yaml.length : newline + 1;
-        // The last line has no line break of its own: take the one before it.
-        if (newline === -1 && start > 0) start -= yaml[start - 2] === "\r" ? 2 : 1;
-        splices.push({ start, end, text: "" });
+        if (newline === -1) removedLastLine = true;
+        splices.push({ start, end: newline === -1 ? yaml.length : newline + 1, text: "" });
     }
     splices.sort((a, b) => b.start - a.start);
     let next = yaml;
     for (const s of splices) next = next.slice(0, s.start) + s.text + next.slice(s.end);
+    // The removed last line had no line break of its own: drop the one now left at the end.
+    if (removedLastLine) next = next.replace(/\r?\n$/, "");
     if (additions.length > 0) next = next + (next === "" ? "" : eol) + additions.join(eol);
     if (next === yaml) return content;
 

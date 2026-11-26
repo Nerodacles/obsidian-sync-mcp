@@ -91,6 +91,13 @@ describe("setProperties", () => {
         assert.equal(setProperties("---\na: 1\nb: 2\n---\nx", {}, ["b"]), "---\na: 1\n---\nx");
         assert.equal(setProperties("---\na: 1\nb:\n  - x\n  - y\nc: 3\n---\n", {}, ["b"]), "---\na: 1\nc: 3\n---\n");
         assert.equal(setProperties("---\na: 1\n---\nx", {}, ["a"]), "---\n---\nx");
+        // Several trailing keys, and the last key while the one before it changes.
+        assert.equal(setProperties("---\na: 1\nb: 2\nc: 3\n---\n", {}, ["b", "c"]), "---\na: 1\n---\n");
+        assert.equal(setProperties("---\r\na: 1\r\nb: 2\r\nc: 3\r\n---\r\n", {}, ["c", "b"]), "---\r\na: 1\r\n---\r\n");
+        assert.equal(setProperties("---\na: 1\nb: 2\nc: 3\n---\n", { b: 5 }, ["c"]), "---\na: 1\nb: 5\n---\n");
+        assert.equal(setProperties("---\na: 1\nb:\n  - x\n---\n", { a: 2 }, ["b"]), "---\na: 2\n---\n");
+        // A name given twice is removed once.
+        assert.equal(setProperties("---\na: 1\nb: 2\nc: 3\n---\n", {}, ["b", "b"]), "---\na: 1\nc: 3\n---\n");
         // Removing a key that isn't there changes nothing.
         assert.equal(setProperties(PLAN, {}, ["missing"]), PLAN);
     });
