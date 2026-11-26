@@ -5,33 +5,36 @@
  * OPS_DATABASE, for `ctx.store`, and write access to the folder, for example
  * WRITE_FOLDERS=ToDo:create+update.
  *
- * Numbering. Numbers are never reused and must stay unique when several
- * agents and several server instances call new_item at once. The next number
- * is max(counter, highest number among the notes in the folder) + 1:
+ * Numbering. Numbers are unique when several agents and several server
+ * instances call new_item at once, and never handed out twice. The counter
+ * (key `counter` in ctx.store) is the last number RESERVED, and a number is
+ * reserved before its note is created:
  *
- *  1. read the counter (key `counter` in ctx.store, the last number handed out);
- *  2. list the folder once and take the highest `moo-<digits>.md` in it, so
- *     notes made by hand are never overwritten and a lost counter recovers;
- *  3. create the note create-only; if that number is taken (another caller got
- *     there first), re-read the counter and try the next free candidate, up to
- *     MAX_CREATE_ATTEMPTS times; nothing is written when every attempt is refused;
- *  4. raise the counter to the number used, by compare-and-swap, never lowering
- *     it. If that fails (conflicts to the bound, or a CouchDB error) the note
- *     still exists and the answer gives its id with a warning: the next call
- *     finds the note in step 2.
+ *  1. read the counter and list the folder once; the candidate is
+ *     max(counter, highest `moo-<digits>.md` in the folder) + 1, so notes made
+ *     by hand are never overwritten and a lost counter recovers;
+ *  2. reserve it: raise the counter to it by compare-and-swap. On a conflict
+ *     (another caller reserved first) take max(candidate, their value + 1)
+ *     and try again; the counter only ever goes up;
+ *  3. create the note create-only at the reserved number. If a note is
+ *     already there (made outside new_item since the listing), that number
+ *     stays unused and the next one is reserved.
  *
- * Gaps: a number is skipped only when a create at it was refused.
+ * Gaps, never reuse: a number is left unused only when it was reserved and
+ * then not created (its create was refused, or the server stopped between
+ * reserving and creating). A note that is later deleted keeps its number
+ * reserved in the counter, even though the server's create-only write would
+ * re-create a deleted path. Steps 2-3 together are bounded by MAX_ROUNDS;
+ * when they run out nothing is written.
  *
- * Limits (stated, not hidden):
- *  - The note is created before the counter is raised. A note that is deleted
- *    after a crash between those two steps leaves its number unknown to both
- *    the counter and the folder listing, and the server's create-only write
- *    re-creates a path whose note was deleted, so that number can be handed
- *    out again. Without that crash, the counter remembers every number.
- *  - op_id: the server's op_id records cover its built-in write tools only,
- *    not plugin tools. new_item therefore refuses a call that carries op_id
- *    rather than silently ignoring it: a retry after a timeout would create a
- *    second item. List the folder before retrying.
+ * op_id: the tool is added with `writes: true`, so the server gives it the
+ * same op_id handling as its built-in write tools (with OPS_DATABASE): a retry
+ * with the same op_id and arguments returns the first answer and creates
+ * nothing, on any instance.
+ *
+ * `created` is today's date (YYYY-MM-DD) in NEW_ITEM_TIMEZONE, else the
+ * server's DISPLAY_TIMEZONE, else UTC. An invalid NEW_ITEM_TIMEZONE stops
+ * startup; an invalid DISPLAY_TIMEZONE falls back to UTC, as the server does.
  *
  * Plain JavaScript with no imports: it runs from any directory, against the
  * built server.
@@ -39,9 +42,8 @@
 
 export const FOLDER = "ToDo/items";
 export const PREFIX = "moo";
-/** 20 callers racing from one snapshot need up to 20 attempts; this leaves room. */
-export const MAX_CREATE_ATTEMPTS = 64;
-export const MAX_RAISE_ATTEMPTS = 64;
+/** Reservation conflicts plus refused creates per call. 20 callers racing on one counter need up to 20; this leaves room. */
+export const MAX_ROUNDS = 100;
 export const COUNTER_KEY = "counter";
 
 const RESERVED_FIELDS = new Set(["id", "title", "created"]);
@@ -95,6 +97,11 @@ export function checkFields(fields) {
     return null;
 }
 
+/** The title as the heading shows it: without `#`, so Obsidian reads no tag there. */
+export function headingTitle(title) {
+    return title.replace(/#/g, "").replace(/\s+/g, " ").trim();
+}
+
 /** The note's text. `title` is one line; `fields` passed checkFields. */
 export function renderNote(n, { title, body, fields = {}, created }) {
     const id = formatId(n);
@@ -105,11 +112,40 @@ export function renderNote(n, { title, body, fields = {}, created }) {
         else if (value.length === 0) lines.push(`${name}: []`);
         else lines.push(`${name}:`, ...value.map((v) => `  - ${scalar(v, name)}`));
     }
-    lines.push("---", "", `# ${id} ${title}`, "");
+    const shown = headingTitle(title);
+    lines.push("---", "", shown ? `# ${id} ${shown}` : `# ${id}`, "");
     let text = lines.join("\n");
     const extra = (body ?? "").replace(/\r\n/g, "\n").replace(/^\n+|\s+$/g, "");
     if (extra) text += "\n" + extra + "\n";
     return text;
+}
+
+function validZone(zone) {
+    try {
+        new Intl.DateTimeFormat("en-US", { timeZone: zone });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** The zone for `created`: { zone, source }. Throws on an invalid NEW_ITEM_TIMEZONE. */
+export function resolveTimeZone(env) {
+    const own = env.NEW_ITEM_TIMEZONE?.trim();
+    if (own) {
+        if (!validZone(own)) throw new Error(`NEW_ITEM_TIMEZONE ${JSON.stringify(own)} is not a valid IANA time zone.`);
+        return { zone: own, source: "NEW_ITEM_TIMEZONE" };
+    }
+    const display = env.DISPLAY_TIMEZONE?.trim();
+    if (display && validZone(display)) return { zone: display, source: "DISPLAY_TIMEZONE" };
+    return { zone: "UTC", source: display ? "UTC (DISPLAY_TIMEZONE is not valid)" : "UTC" };
+}
+
+/** `date` as YYYY-MM-DD in `zone`. */
+export function localDate(date, zone) {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" })
+        .formatToParts(date).map((p) => [p.type, p.value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 export function deepLink(vaultName, path) {
@@ -119,94 +155,83 @@ export function deepLink(vaultName, path) {
 const isTaken = (err) => err?.name === "PluginWriteError" && err.code === "exists";
 
 /**
- * Allocate a number and create the note. Returns
- *   { created: true, n, path, skipped, counterRaised }  or
- *   { created: false, skipped }  (every attempt refused; nothing written).
- * Any other write refusal (WRITE_FOLDERS, read-only, CouchDB failure) is thrown.
+ * Reserve a number, then create the note at it. Returns
+ *   { created: true, n, path, gaps, conflicts }  or
+ *   { created: false, gaps, conflicts }  (rounds exhausted; nothing written),
+ * where `gaps` are numbers reserved and left unused because a note was
+ * already there, and `conflicts` the reservations lost to other callers.
+ * Any other write refusal is thrown with `reserved` set to the number it
+ * left unused.
  */
 export async function createItem({ store, vault }, render) {
     let counter = await store.get(COUNTER_KEY);
-    const fromFiles = highestNumber(await vault.listNotes(FOLDER));
-    let n = Math.max(counterValue(counter), fromFiles) + 1;
-    const skipped = [];
-    let created = false;
-    for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt++) {
+    let next = Math.max(counterValue(counter), highestNumber(await vault.listNotes(FOLDER))) + 1;
+    const gaps = [];
+    let conflicts = 0;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+        const n = Math.max(next, counterValue(counter) + 1);
+        const res = await store.put(COUNTER_KEY, n, counter?.revision ?? null);
+        if (res.conflict) {
+            conflicts++;
+            counter = res.current;
+            continue;
+        }
+        counter = { value: n, revision: res.revision };
         try {
             await vault.writeNote(itemPath(n), render(n), { createOnly: true });
-            created = true;
-            break;
         } catch (err) {
-            if (!isTaken(err)) throw err;
-            skipped.push(n);
-            // Someone else took n; others may have moved the counter further on.
-            counter = await store.get(COUNTER_KEY);
-            n = Math.max(n, counterValue(counter)) + 1;
-        }
-    }
-    if (!created) return { created: false, skipped };
-
-    // Raise the counter to n, never lowering it. The note exists by now, so a
-    // failure here is reported with the result, never thrown: an error answer
-    // would hide the id and invite a retry that creates a second item.
-    let counterRaised = false;
-    let counterError;
-    try {
-        for (let attempt = 0; attempt < MAX_RAISE_ATTEMPTS; attempt++) {
-            if (counterValue(counter) >= n) {
-                counterRaised = true;
-                break;
+            if (!isTaken(err)) {
+                if (err && typeof err === "object") err.reserved = n;
+                throw err;
             }
-            const res = await store.put(COUNTER_KEY, n, counter?.revision ?? null);
-            if (!res.conflict) {
-                counterRaised = true;
-                break;
-            }
-            counter = res.current;
+            gaps.push(n);
+            next = n + 1;
+            continue;
         }
-    } catch (err) {
-        counterError = err instanceof Error ? err.message : String(err);
+        return { created: true, n, path: itemPath(n), gaps, conflicts };
     }
-    return { created: true, n, path: itemPath(n), skipped, counterRaised, ...(counterError ? { counterError } : {}) };
+    return { created: false, gaps, conflicts };
 }
 
 export default function register(ctx) {
     const { z } = ctx;
+    const { zone, source } = resolveTimeZone(process.env);
+    ctx.log(`new_item: created dates in ${zone} (${source}).`);
     const value = z.union([z.string(), z.number(), z.boolean()]);
     ctx.addTool({
         name: "new_item",
+        writes: true,
         description:
             `Create the next numbered work item, ${FOLDER}/${PREFIX}-NNN.md, with a fresh number that no other caller gets and that is never reused. ` +
-            "Frontmatter: id, title, created (today, UTC date), state (new unless given in fields) and any fields you pass. " +
-            "The body starts with a heading '# <id> <title>', then your body text. Returns the id and path. " +
-            "op_id is not supported for this tool: a call with op_id is refused, so after a timeout list the folder before calling again.",
+            `Frontmatter: id, title, created (today's date in ${zone}), state (new unless given in fields) and any fields you pass. ` +
+            "The body starts with a heading '# <id> <title>' (without # characters from the title), then your body text. Returns the id and path. " +
+            "Pass an op_id to make a retry safe: the same op_id returns the first answer and creates nothing.",
         parameters: z.object({
             title: z.string().trim().min(1).max(200).describe("One line."),
             body: z.string().max(100_000).optional().describe("Markdown placed after the heading."),
             fields: z.record(z.string(), z.union([value, z.array(value)])).optional()
                 .describe("Extra frontmatter: strings, numbers, booleans, or lists of them. id, title and created are set by the tool."),
-            op_id: z.string().optional().describe("Not supported: a call with op_id is refused without writing."),
         }),
-        execute: async ({ title, body, fields, op_id }) => {
-            if (op_id !== undefined) {
-                return "new_item does not support op_id: the server's op_id records cover only its built-in write tools, so a retry could not be recognised. " +
-                    `Nothing was written. Call again without op_id; after a timeout, list ${FOLDER} first to see whether the item was created.`;
-            }
+        execute: async ({ title, body, fields }) => {
             if (!ctx.store) return "new_item needs OPS_DATABASE (CouchDB mode) for its counter. Nothing was written.";
             if (/[\r\n]/.test(title)) return "title must be one line. Nothing was written.";
             const bad = checkFields(fields);
             if (bad) return `${bad} Nothing was written.`;
-            const created = new Date().toISOString().slice(0, 10);
-            const result = await createItem(ctx, (n) => renderNote(n, { title, body, fields, created }));
+            const created = localDate(new Date(), zone);
+            let result;
+            try {
+                result = await createItem(ctx, (n) => renderNote(n, { title, body, fields, created }));
+            } catch (err) {
+                if (err?.name !== "PluginWriteError") throw err;
+                return `${err.message}\nNothing was written; ${formatId(err.reserved)} was reserved and stays unused.`;
+            }
+            const unused = result.gaps.length ? `Reserved but already taken, left unused: ${result.gaps.map(formatId).join(", ")}.` : null;
             if (!result.created) {
-                return `Could not allocate an item number: ${MAX_CREATE_ATTEMPTS} numbers in a row were taken by other callers ` +
-                    `(${formatId(result.skipped[0])} to ${formatId(result.skipped.at(-1))}). Nothing was written; try again.`;
+                return `Could not allocate an item number in ${MAX_ROUNDS} rounds (${result.conflicts} reservations lost to other callers). ` +
+                    `Nothing was written; try again.${unused ? "\n" + unused : ""}`;
             }
-            const id = formatId(result.n);
-            const lines = [`Created ${id}: ${result.path}`, `[Open in Obsidian](${deepLink(ctx.vaultName, result.path)})`];
-            if (result.skipped.length) lines.push(`Taken by other callers first: ${result.skipped.map(formatId).join(", ")}.`);
-            if (!result.counterRaised) {
-                lines.push(`Warning: the counter could not be raised to ${result.n}${result.counterError ? ` (${result.counterError})` : ""}; the note exists, and the next call still sees it in ${FOLDER}.`);
-            }
+            const lines = [`Created ${formatId(result.n)}: ${result.path}`, `[Open in Obsidian](${deepLink(ctx.vaultName, result.path)})`];
+            if (unused) lines.push(unused);
             return lines.join("\n");
         },
     });
