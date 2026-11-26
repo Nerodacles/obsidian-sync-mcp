@@ -39,17 +39,17 @@ function stubVault(existing: string[] = [], hidden: string[] = []) {
 
 describe("new_item plugin: numbering", () => {
     it("formats ids zero-padded to 3 and grows past 999", () => {
-        assert.equal(formatId(1), "moo-001");
-        assert.equal(formatId(42), "moo-042");
-        assert.equal(formatId(999), "moo-999");
-        assert.equal(formatId(1000), "moo-1000");
-        assert.equal(itemPath(7), "ToDo/items/moo-007.md");
+        assert.equal(formatId(1), "item-001");
+        assert.equal(formatId(42), "item-042");
+        assert.equal(formatId(999), "item-999");
+        assert.equal(formatId(1000), "item-1000");
+        assert.equal(itemPath(7), "ToDo/items/item-007.md");
     });
 
     it("highest number counts only item notes directly in the folder", () => {
         assert.equal(highestNumber([]), 0);
-        assert.equal(highestNumber(["ToDo/items/moo-007.md", "ToDo/items/moo-1002.md", "ToDo/items/moo-0042.md"]), 1002);
-        assert.equal(highestNumber(["ToDo/items/moo-9.txt", "ToDo/items/sub/moo-500.md", "ToDo/moo-400.md", "ToDo/items/xmoo-300.md", "ToDo/items/moo-300a.md"]), 0);
+        assert.equal(highestNumber(["ToDo/items/item-007.md", "ToDo/items/item-1002.md", "ToDo/items/item-0042.md"]), 1002);
+        assert.equal(highestNumber(["ToDo/items/item-9.txt", "ToDo/items/sub/item-500.md", "ToDo/item-400.md", "ToDo/items/xitem-300.md", "ToDo/items/item-300a.md"]), 0);
     });
 
     const counterOf = async (store: any) => (await store.get("counter"))?.value;
@@ -64,7 +64,7 @@ describe("new_item plugin: numbering", () => {
             return write(path, content, o);
         };
         const r = await createItem({ store, vault }, (n: number) => `n=${n}`);
-        assert.deepEqual(r, { created: true, n: 1, path: "ToDo/items/moo-001.md", gaps: [], conflicts: 0 });
+        assert.deepEqual(r, { created: true, n: 1, path: "ToDo/items/item-001.md", gaps: [], conflicts: 0 });
         const r2 = await createItem({ store, vault }, (n: number) => `n=${n}`);
         assert.equal(r2.n, 2);
         assert.deepEqual(seen, [1, 2], "the counter already held each number when its note was created");
@@ -75,22 +75,22 @@ describe("new_item plugin: numbering", () => {
         // Files ahead (notes made by hand, or a lost counter).
         let store = scopedStore(new MemoryDocStore(), "new-item.mjs");
         await store.put("counter", 5, null);
-        let r = await createItem({ store, vault: stubVault(["ToDo/items/moo-009.md"]) }, () => "");
+        let r = await createItem({ store, vault: stubVault(["ToDo/items/item-009.md"]) }, () => "");
         assert.equal(r.n, 10);
         assert.equal(await counterOf(store), 10);
         // Counter ahead (a note was deleted: its number is not reused).
         store = scopedStore(new MemoryDocStore(), "new-item.mjs");
         await store.put("counter", 12, null);
-        r = await createItem({ store, vault: stubVault(["ToDo/items/moo-003.md"]) }, () => "");
+        r = await createItem({ store, vault: stubVault(["ToDo/items/item-003.md"]) }, () => "");
         assert.equal(r.n, 13);
     });
 
     it("a reserved number whose create is refused stays unused: a gap, and the next number is reserved", async () => {
         const store = scopedStore(new MemoryDocStore(), "new-item.mjs");
-        const vault = stubVault(["ToDo/items/moo-001.md"], ["ToDo/items/moo-002.md", "ToDo/items/moo-003.md"]);
+        const vault = stubVault(["ToDo/items/item-001.md"], ["ToDo/items/item-002.md", "ToDo/items/item-003.md"]);
         const r = await createItem({ store, vault }, () => "");
-        assert.deepEqual(r, { created: true, n: 4, path: "ToDo/items/moo-004.md", gaps: [2, 3], conflicts: 0 });
-        assert.deepEqual(vault.writes, ["ToDo/items/moo-002.md", "ToDo/items/moo-003.md", "ToDo/items/moo-004.md"]);
+        assert.deepEqual(r, { created: true, n: 4, path: "ToDo/items/item-004.md", gaps: [2, 3], conflicts: 0 });
+        assert.deepEqual(vault.writes, ["ToDo/items/item-002.md", "ToDo/items/item-003.md", "ToDo/items/item-004.md"]);
         assert.equal(await counterOf(store), 4);
     });
 
@@ -107,8 +107,8 @@ describe("new_item plugin: numbering", () => {
             return realPut(key, value, rev);
         };
         const r = await createItem({ store, vault }, () => "");
-        assert.deepEqual(r, { created: true, n: 21, path: "ToDo/items/moo-021.md", gaps: [], conflicts: 1 });
-        assert.deepEqual(vault.writes, ["ToDo/items/moo-021.md"], "never tried a number someone else reserved");
+        assert.deepEqual(r, { created: true, n: 21, path: "ToDo/items/item-021.md", gaps: [], conflicts: 1 });
+        assert.deepEqual(vault.writes, ["ToDo/items/item-021.md"], "never tried a number someone else reserved");
         assert.equal(await counterOf(store), 21);
     });
 
@@ -119,10 +119,10 @@ describe("new_item plugin: numbering", () => {
         await createItem({ store, vault }, () => "");
         await assert.rejects(createItem({ store, vault: { ...vault, writeNote: async () => { throw new Error("process died"); } } }, () => ""), /process died/);
         // The note of item 1 is deleted later.
-        vault.notes.delete("ToDo/items/moo-001.md");
+        vault.notes.delete("ToDo/items/item-001.md");
         const r = await createItem({ store, vault }, () => "");
         assert.equal(r.n, 3, "neither the deleted 1 nor the reserved-but-uncreated 2 is handed out");
-        assert.deepEqual([...vault.notes.keys()], ["ToDo/items/moo-003.md"]);
+        assert.deepEqual([...vault.notes.keys()], ["ToDo/items/item-003.md"]);
     });
 
     it("on exhaustion it refuses and writes nothing", async () => {
@@ -147,7 +147,7 @@ describe("new_item plugin: numbering", () => {
     it("never lowers the counter", async () => {
         const store = scopedStore(new MemoryDocStore(), "new-item.mjs");
         await store.put("counter", 50, null);
-        const r = await createItem({ store, vault: stubVault(["ToDo/items/moo-007.md"]) }, () => "");
+        const r = await createItem({ store, vault: stubVault(["ToDo/items/item-007.md"]) }, () => "");
         assert.equal(r.n, 51);
         assert.equal(await counterOf(store), 51);
     });
@@ -193,7 +193,7 @@ describe("new_item plugin: note text", () => {
         const text = renderNote(42, tricky);
         const fm = text.match(/^---\n([\s\S]*?)\n---\n/)![1];
         assert.deepEqual(parseYaml(fm), {
-            id: "moo-042",
+            id: "item-042",
             title: tricky.title,
             created: "2026-01-02",
             state: "new",
@@ -201,19 +201,19 @@ describe("new_item plugin: note text", () => {
         });
         const meta = parseFrontmatterAndLinks(text);
         assert.equal(meta.frontmatterError, undefined);
-        assert.equal(meta.frontmatter.id, "moo-042");
+        assert.equal(meta.frontmatter.id, "item-042");
         assert.equal(meta.frontmatter.title, tricky.title);
         assert.equal(meta.frontmatter.state, "new");
         assert.equal(meta.frontmatter.looksLikeNumber, "1.10");
         assert.deepEqual(meta.properties.tags, ["infra", "agents"]);
         // The heading drops the title's "#", so no tag comes from it; the frontmatter keeps the exact text.
         assert.deepEqual(meta.tags.sort(), ["agents", "infra"]);
-        assert.ok(text.endsWith(`\n# moo-042 Fix "quotes": colons, hash & 'apostrophes' — ünïcode\n\nSome **text**.\n\n- a list\n`), text);
+        assert.ok(text.endsWith(`\n# item-042 Fix "quotes": colons, hash & 'apostrophes' — ünïcode\n\nSome **text**.\n\n- a list\n`), text);
     });
 
     it("state from fields replaces the default; no body means just the heading", () => {
         const text = renderNote(1, { title: "T", created: "2026-01-02", fields: { state: "doing" } });
-        assert.equal(text, '---\nid: moo-001\ntitle: "T"\ncreated: 2026-01-02\nstate: "doing"\n---\n\n# moo-001 T\n');
+        assert.equal(text, '---\nid: item-001\ntitle: "T"\ncreated: 2026-01-02\nstate: "doing"\n---\n\n# item-001 T\n');
     });
 
     it("refuses reserved, malformed and non-scalar fields", () => {
@@ -230,9 +230,9 @@ describe("new_item plugin: note text", () => {
         assert.equal(headingTitle("Fix #infra ##now c#"), "Fix infra now c");
         const text = renderNote(7, { title: "#tag in # title", created: "2026-01-02" });
         assert.match(text, /\ntitle: "#tag in # title"\n/);
-        assert.ok(text.endsWith("\n# moo-007 tag in title\n"), text);
+        assert.ok(text.endsWith("\n# item-007 tag in title\n"), text);
         assert.deepEqual(parseFrontmatterAndLinks(text).tags, []);
-        assert.ok(renderNote(8, { title: "###", created: "2026-01-02" }).endsWith("\n# moo-008\n"));
+        assert.ok(renderNote(8, { title: "###", created: "2026-01-02" }).endsWith("\n# item-008\n"));
     });
 
     it("created is the local date in the configured zone", () => {
@@ -247,7 +247,7 @@ describe("new_item plugin: note text", () => {
     });
 
     it("deep link matches the server's", () => {
-        assert.equal(deepLink("My Vault", "ToDo/items/moo-001.md"), "obsidian://open?vault=My%20Vault&file=ToDo%2Fitems%2Fmoo-001");
+        assert.equal(deepLink("My Vault", "ToDo/items/item-001.md"), "obsidian://open?vault=My%20Vault&file=ToDo%2Fitems%2Fitem-001");
     });
 });
 
@@ -292,10 +292,10 @@ describe("new_item plugin: loaded by the server", () => {
     it("creates the note and answers with id, path and deep link", async () => {
         const { vault, call, docs } = await setup("ToDo:create+update");
         const answer = await call({ title: "Rotate the backup key", body: "Details.", fields: { owner: "ops" } });
-        assert.equal(answer, "Created moo-001: ToDo/items/moo-001.md\n[Open in Obsidian](obsidian://open?vault=Work%20Vault&file=ToDo%2Fitems%2Fmoo-001)");
-        const text = (await vault.readNote("ToDo/items/moo-001.md"))!;
-        assert.match(text, /^---\nid: moo-001\ntitle: "Rotate the backup key"\ncreated: \d{4}-\d{2}-\d{2}\nstate: new\nowner: "ops"\n---\n\n# moo-001 Rotate the backup key\n\nDetails\.\n$/);
-        assert.match(await call({ title: "Second" }), /^Created moo-002:/);
+        assert.equal(answer, "Created item-001: ToDo/items/item-001.md\n[Open in Obsidian](obsidian://open?vault=Work%20Vault&file=ToDo%2Fitems%2Fitem-001)");
+        const text = (await vault.readNote("ToDo/items/item-001.md"))!;
+        assert.match(text, /^---\nid: item-001\ntitle: "Rotate the backup key"\ncreated: \d{4}-\d{2}-\d{2}\nstate: new\nowner: "ops"\n---\n\n# item-001 Rotate the backup key\n\nDetails\.\n$/);
+        assert.match(await call({ title: "Second" }), /^Created item-002:/);
         assert.equal(docs.docs.get("plugin:new-item.mjs:counter")!.value, 2);
     });
 
@@ -303,13 +303,13 @@ describe("new_item plugin: loaded by the server", () => {
         const { vault, call, tool, opStore } = await setup("ToDo:create+update");
         assert.ok("op_id" in tool().parameters.shape, "the server added op_id");
         const first = await call({ title: "Once", op_id: "item-1" });
-        assert.match(first, /^Created moo-001:/);
+        assert.match(first, /^Created item-001:/);
         assert.equal(await call({ title: "Once", op_id: "item-1" }), first);
         assert.match(await call({ title: "Other", op_id: "item-1" }), /already used for a different call/);
-        assert.deepEqual(await vault.listNotes("ToDo/items"), ["ToDo/items/moo-001.md"]);
+        assert.deepEqual(await vault.listNotes("ToDo/items"), ["ToDo/items/item-001.md"]);
         assert.equal(opStore!.records.size, 1);
         // Without op_id every call creates.
-        assert.match(await call({ title: "Once" }), /^Created moo-002:/);
+        assert.match(await call({ title: "Once" }), /^Created item-002:/);
     });
 
     it("op_id without OPS_DATABASE is refused like the built-in tools'", async () => {
@@ -329,18 +329,18 @@ describe("new_item plugin: loaded by the server", () => {
         assert.ok(zoned.logs.some((l) => l.includes("created dates in Pacific/Kiritimati (NEW_ITEM_TIMEZONE)")), zoned.logs.join("\n"));
         await zoned.call({ title: "x" });
         // UTC+14: computed after the call, so a midnight crossing during the test can't flake it unnoticed.
-        assert.match((await zoned.vault.readNote("ToDo/items/moo-001.md"))!, new RegExp(`\ncreated: ${localDate(new Date(), "Pacific/Kiritimati")}\n`));
+        assert.match((await zoned.vault.readNote("ToDo/items/item-001.md"))!, new RegExp(`\ncreated: ${localDate(new Date(), "Pacific/Kiritimati")}\n`));
         const display = await setup("ToDo:create+update", { env: { DISPLAY_TIMEZONE: "Pacific/Pago_Pago" } });
         assert.ok(display.logs.some((l) => l.includes("created dates in Pacific/Pago_Pago (DISPLAY_TIMEZONE)")));
         await display.call({ title: "x" });
         // UTC-11 and UTC+14 are never both on the UTC date, so a plugin that ignored the zone fails one of the two at any hour.
-        assert.match((await display.vault.readNote("ToDo/items/moo-001.md"))!, new RegExp(`\ncreated: ${localDate(new Date(), "Pacific/Pago_Pago")}\n`));
+        assert.match((await display.vault.readNote("ToDo/items/item-001.md"))!, new RegExp(`\ncreated: ${localDate(new Date(), "Pacific/Pago_Pago")}\n`));
         await assert.rejects(setup("ToDo:create+update", { env: { NEW_ITEM_TIMEZONE: "Mars/Base" } }), /new-item\.mjs failed during setup: NEW_ITEM_TIMEZONE "Mars\/Base"/);
     });
 
     it("refuses a missing store, reserved fields and multi-line titles, writing nothing", async () => {
         const { vault, call, docs } = await setup("ToDo:create+update");
-        assert.match(await call({ title: "x", fields: { id: "moo-999" } }), /set by new_item[\s\S]*Nothing was written/);
+        assert.match(await call({ title: "x", fields: { id: "item-999" } }), /set by new_item[\s\S]*Nothing was written/);
         assert.match(await call({ title: "one\ntwo" }), /one line/);
         assert.deepEqual(await vault.listNotes("ToDo"), []);
         assert.equal(docs.docs.size, 0, "nothing reserved");
@@ -353,7 +353,7 @@ describe("new_item plugin: loaded by the server", () => {
         const { vault, call, docs } = await setup("Inbox:create");
         const answer = await call({ title: "x" });
         assert.match(answer, /Write access denied|outside|only allowed/i);
-        assert.match(answer, /Nothing was written; moo-001 was reserved and stays unused\.$/);
+        assert.match(answer, /Nothing was written; item-001 was reserved and stays unused\.$/);
         assert.deepEqual(await vault.listNotes("ToDo"), []);
         assert.equal(docs.docs.get("plugin:new-item.mjs:counter")!.value, 1);
     });

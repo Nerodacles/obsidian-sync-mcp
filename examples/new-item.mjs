@@ -1,5 +1,5 @@
 /**
- * new_item: create the next numbered work item, `ToDo/items/moo-NNN.md`.
+ * new_item: create the next numbered work item, `ToDo/items/<prefix>-NNN.md` (prefix from NEW_ITEM_PREFIX, default `item`).
  *
  * Load it with PLUGIN_DIR (copy this file into that directory). It needs
  * OPS_DATABASE, for `ctx.store`, and write access to the folder, for example
@@ -11,7 +11,7 @@
  * reserved before its note is created:
  *
  *  1. read the counter and list the folder once; the candidate is
- *     max(counter, highest `moo-<digits>.md` in the folder) + 1, so notes made
+ *     max(counter, highest `<prefix>-<digits>.md` in the folder) + 1, so notes made
  *     by hand are never overwritten and a lost counter recovers;
  *  2. reserve it: raise the counter to it by compare-and-swap. On a conflict
  *     (another caller reserved first) take max(candidate, their value + 1)
@@ -41,7 +41,12 @@
  */
 
 export const FOLDER = "ToDo/items";
-export const PREFIX = "moo";
+/** File and id prefix: NEW_ITEM_PREFIX, else "item" (lowercase letters, digits, hyphens). */
+export const PREFIX = (() => {
+    const raw = (process.env.NEW_ITEM_PREFIX ?? "").trim() || "item";
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(raw)) throw new Error(`NEW_ITEM_PREFIX must be lowercase letters, digits or hyphens, starting with a letter: ${JSON.stringify(raw)}`);
+    return raw;
+})();
 /** Reservation conflicts plus refused creates per call. 20 callers racing on one counter need up to 20; this leaves room. */
 export const MAX_ROUNDS = 100;
 export const COUNTER_KEY = "counter";
@@ -58,7 +63,7 @@ export function itemPath(n) {
     return `${FOLDER}/${formatId(n)}.md`;
 }
 
-/** Highest item number among `paths` (0 when there is none). Any digit count counts, so moo-0042 is 42. */
+/** Highest item number among `paths` (0 when there is none). Any digit count counts, so item-0042 is 42. */
 export function highestNumber(paths) {
     let max = 0;
     for (const p of paths) {
