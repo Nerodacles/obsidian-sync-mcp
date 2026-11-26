@@ -46,18 +46,16 @@ const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note", "ren
 
 /**
  * edit_note rounds when another writer changes the note between its read and
- * its write (CouchDB mode): at least this many, and more until
- * EDIT_MIN_RETRY_MS has passed (at most 5 x this many). Edits queued on one
- * server are written together (see CouchVault.updateNote), so rounds are lost
- * only to other instances. Measured with the concurrency harness, two
- * instances, 20 writers appending to one note with up to 100 ms between edits:
- * all 400 land on a local CouchDB; where a round trip is slow and the note
- * gets more edits than it can absorb, a few may still be refused. A refused
- * edit answers "Failed to edit note" and writes nothing; it is never silently
- * dropped.
+ * its write (CouchDB mode): at least this many, then more until
+ * EDIT_MIN_RETRY_MS has passed or 5 x this many rounds have run, whichever
+ * comes first (on a fast database usually the round cap). write_note uses the
+ * same budget to replace an existing note. Edits queued on one server are
+ * written together (see CouchVault.updateNote), so rounds are lost only to
+ * other instances. A refused edit answers "Failed to edit note" and writes
+ * nothing; it is never silently dropped.
  */
 export const EDIT_MAX_ATTEMPTS = 10;
-/** edit_note keeps retrying past EDIT_MAX_ATTEMPTS until this much time has passed (at most 5 x the attempts). */
+/** edit_note keeps retrying past EDIT_MAX_ATTEMPTS until this much time has passed or 5 x the attempts have run. */
 export const EDIT_MIN_RETRY_MS = 3000;
 
 export const NO_REVISIONS_MESSAGE =
@@ -170,8 +168,13 @@ function describeMismatch(err: RevisionMismatchError): string {
     return `Revision mismatch: ${err.path} is at revision ${err.current}, not ${err.expected}. Nothing was written; read the note again and reapply your change.`;
 }
 
+// Shaped like a CouchDB revision (`<generation>-<hex>`): the value is echoed in
+// the mismatch answer, so an empty, huge or multi-line value is refused here.
 const expectedRevisionParam = z
     .string()
+    .min(1)
+    .max(100)
+    .regex(/^[1-9]\d*-[0-9a-f]+$/, "expected_revision must be a revision from read_note or get_note_metadata, like 12-3f9c...")
     .optional()
     .describe("Optional, CouchDB mode: the revision from read_note or get_note_metadata. The write only happens if the note is still at that revision; otherwise nothing is written and the current revision is returned.");
 export const NO_OP_STORE_MESSAGE = "op_id needs OPS_DATABASE (CouchDB mode): this server keeps no operation records. Nothing was written.";
@@ -320,13 +323,18 @@ export function registerTools(
             const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
             let ok: boolean;
             try {
-                ok = await vault.writeNote(path, content, { mode });
+                // CouchDB mode replaces an existing note with a revision-checked put,
+                // retried within edit_note's budget.
+                ok = await vault.writeNote(path, content, { mode, maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
             } catch (err) {
                 if (err instanceof NoteExistsError) {
                     if (create_only) return `Note already exists: ${path}. Nothing was written (create_only); choose a new path.`;
                     return `${checkWrite(path, "update", writeFolders)} The note already exists; choose a new path.`;
                 }
                 if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders)!;
+                if (err instanceof UpdateRetriesExhaustedError) {
+                    return `Failed to write note: ${path} kept changing during ${err.attempts} attempts. Nothing was written; try again.`;
+                }
                 throw err;
             }
             if (!ok) {
