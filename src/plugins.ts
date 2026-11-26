@@ -17,7 +17,7 @@
  * load, does not export a function, throws, or adds a tool whose name is
  * taken, so a broken plugin is never half-loaded.
  */
-import { readdir } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
@@ -152,10 +152,20 @@ export interface LoadOptions {
 /** Load every plugin in `dir`. Throws, naming the file, on the first one that fails. Returns the files loaded. */
 export async function loadPlugins(dir: string, options: LoadOptions): Promise<string[]> {
     const root = resolve(dir);
-    const files = (await readdir(root, { withFileTypes: true }))
-        .filter((e) => e.isFile() && /\.(m?js)$/.test(e.name))
-        .map((e) => e.name)
-        .sort();
+    // A symlink counts when it points at a file: a Kubernetes ConfigMap volume
+    // presents every key as a symlink. A link to nothing stops startup like a
+    // plugin that fails to load.
+    const files: string[] = [];
+    for (const e of await readdir(root, { withFileTypes: true })) {
+        if (!/\.(m?js)$/.test(e.name)) continue;
+        if (e.isFile()) files.push(e.name);
+        else if (e.isSymbolicLink()) {
+            const target = await stat(join(root, e.name)).catch(() => null);
+            if (!target) throw new Error(`plugin ${e.name} is a symlink to nothing.`);
+            if (target.isFile()) files.push(e.name);
+        }
+    }
+    files.sort();
     const vault = guardedVault(options.vault, options.searchIndex, options.writeFolders, options.readOnly);
     for (const file of files) {
         const where = `plugin ${file}`;

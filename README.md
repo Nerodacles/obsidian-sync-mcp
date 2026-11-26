@@ -225,7 +225,7 @@ Local mode has no revisions: reads show none, and `expected_revision` is refused
 
 ### Plugins (opt-in)
 
-Set `PLUGIN_DIR` to load extra tools at startup. Each `.js` or `.mjs` file directly in that directory, in name order, default-exports a function that receives a context:
+Set `PLUGIN_DIR` to load extra tools at startup. Each `.js` or `.mjs` file directly in that directory (a symlink to a file counts, as in a Kubernetes ConfigMap volume), in name order, default-exports a function that receives a context:
 
 ```js
 // plugins/add-task.mjs
