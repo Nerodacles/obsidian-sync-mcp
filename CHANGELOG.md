@@ -4,6 +4,9 @@
 
 ### Features
 - **Plugins (`PLUGIN_DIR`, opt-in).** Add your own tools without forking: each `.js`/`.mjs` file in the directory registers tools at startup through a small context whose vault calls apply the same `READ_ONLY` and `WRITE_FOLDERS` checks as the built-in tools. A plugin that fails to load, or reuses a tool name, stops startup with a message naming the file.
+- **Plugins get `ctx.store` (with `OPS_DATABASE`).** A small revision-checked key/value store shared by every server instance: `get(key)` and `put(key, value, expectedRevision)`, where `null` means create-only and a stale revision returns `{ conflict: true, current }` instead of writing. Keys are namespaced per plugin file, values are JSON, kept in the `OPS_DATABASE` database. Absent without `OPS_DATABASE` or in `READ_ONLY` mode. See [Plugins](README.md#plugins-opt-in).
+- A refused plugin write (`PluginWriteError`) carries a `code` (`exists`, `denied`, `read_only`, `not_found`, `revision_mismatch`, `unsupported`, `failed`), so a plugin can react to a taken path without parsing the message.
+- `examples/new-item.mjs`: an example plugin that creates numbered notes with unique numbers across instances, using both.
 - **`write_note` takes `create_only`.** With `create_only: true` the write only creates: if a note already exists at the path, nothing is written and the answer says so. Useful for agents that pick a file name and must not clobber someone else's note.
 - **`op_id` makes retried writes safe (opt-in, CouchDB mode).** Set `OPS_DATABASE` to a database name and the write tools accept an `op_id`: a call repeated with the same id (an agent retrying after a timeout) returns the first answer instead of appending or writing again. Records live in that separate database, so they work across server instances and restarts and are never synced to Obsidian. Without `OPS_DATABASE` nothing changes and `op_id` is refused.
 
@@ -11,6 +14,7 @@
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
 
 ### Tests
+- `npm run test:new-item`: `ctx.store` against a real CouchDB (create-only, stale revision, a revision for a missing key, a failure that is not a conflict), then 20 concurrent calls of the example plugin through two server instances: 20 distinct numbers with no gaps, 20 notes each holding its own caller's text, and the counter at the highest number.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 
 ## 0.14.0
