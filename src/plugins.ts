@@ -21,10 +21,10 @@ import { readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
-import { NoteExistsError, NoteNotFoundError, type NoteInfo, type VaultBackend } from "./vault-backend.js";
+import { NoteExistsError, NoteNotFoundError, RevisionMismatchError, type NoteInfo, type RevisedNote, type VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
 import { checkWrite, type WriteScope } from "./write-scope.js";
-import { chooseWriteMode, editNoteText } from "./tools.js";
+import { chooseWriteMode, editNoteText, NO_REVISIONS_MESSAGE } from "./tools.js";
 import { READ_ONLY_MESSAGE } from "./vault-readonly.js";
 
 /** A write a plugin asked for was refused; the message is meant for the agent. */
@@ -39,8 +39,14 @@ export interface PluginVault {
     readNote(path: string): Promise<string | null>;
     getMetadata(path: string): Promise<NoteInfo | null>;
     listNotes(folder?: string): Promise<string[]>;
-    /** Create or replace a note, as write_note does; `createOnly` never replaces. */
-    writeNote(path: string, content: string, options?: { createOnly?: boolean }): Promise<void>;
+    /** CouchDB mode: the note and its revision, as read_note shows them. Undefined in local mode. */
+    readNoteRevision?(path: string): Promise<RevisedNote | null>;
+    /**
+     * Create or replace a note, as write_note does; `createOnly` never replaces,
+     * and `expectedRevision` (CouchDB mode) writes only if the note is still at
+     * that revision, as write_note's expected_revision does.
+     */
+    writeNote(path: string, content: string, options?: { createOnly?: boolean; expectedRevision?: string }): Promise<void>;
     /** Change a note's text as edit_note does; returns the new text. */
     editNote(path: string, apply: (content: string) => string): Promise<string>;
     deleteNote(path: string): Promise<void>;
@@ -94,8 +100,23 @@ export function guardedVault(vault: VaultBackend, searchIndex: SearchIndex, writ
         readNote: (path) => vault.readNote(path),
         getMetadata: (path) => vault.getMetadata(path),
         listNotes: (folder) => vault.listNotes(folder),
-        async writeNote(path, content, { createOnly = false } = {}) {
+        ...(vault.readNoteRevision ? { readNoteRevision: (path: string) => vault.readNoteRevision!(path) } : {}),
+        async writeNote(path, content, { createOnly = false, expectedRevision } = {}) {
             writable();
+            if (expectedRevision !== undefined) {
+                if (createOnly) throw new PluginWriteError("expectedRevision names an existing note, so it can't be combined with createOnly.");
+                deny(checkWrite(path, "update", writeFolders));
+                if (!vault.updateNote) throw new PluginWriteError(NO_REVISIONS_MESSAGE);
+                try {
+                    await vault.updateNote(path, () => content, { expectedRevision });
+                } catch (err) {
+                    if (err instanceof RevisionMismatchError) throw new PluginWriteError(err.message);
+                    if (err instanceof NoteNotFoundError) throw new PluginWriteError(`Note not found: ${path}`);
+                    throw err;
+                }
+                searchIndex.update(path, content, Date.now());
+                return;
+            }
             const choice = createOnly ? { mode: "create" as const } : chooseWriteMode(path, writeFolders);
             if ("denied" in choice) throw new PluginWriteError(choice.denied);
             if (createOnly) deny(checkWrite(path, "create", writeFolders));
