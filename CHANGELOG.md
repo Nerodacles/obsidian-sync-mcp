@@ -8,6 +8,8 @@
 - A refused plugin write (`PluginWriteError`) carries a `code` (`exists`, `denied`, `read_only`, `not_found`, `revision_mismatch`, `unsupported`, `failed`), so a plugin can react to a taken path without parsing the message.
 - Plugin tools can be marked `writes: true`: they then take `op_id` exactly like the built-in write tools (with `OPS_DATABASE`), and `READ_ONLY` leaves them out.
 - `examples/new-item.mjs`: an example plugin that creates numbered notes with unique numbers across instances, never reused: it reserves each number in `ctx.store` before creating the note, takes `op_id`, and dates notes in `NEW_ITEM_TIMEZONE` / `DISPLAY_TIMEZONE`.
+- **Plugins can follow note changes: `ctx.onNoteChange` (CouchDB mode).** Every change the server applies to its index from the CouchDB changes feed, including edits made in Obsidian, is offered to plugins; `ctx.parseFrontmatter` reads properties with the server's parser. A listener that fails never reaches the index.
+- `examples/desk-answer-webhook.mjs`: an example plugin that POSTs one HMAC-signed event per `go`/`answer` set on a note in `ToDo/items/` (`DESK_WEBHOOK_URL`, `DESK_WEBHOOK_SECRET`; needs `OPS_DATABASE`), once per answer across re-saves, restarts and instances.
 - **`write_note` takes `create_only`.** With `create_only: true` the write only creates: if a note already exists at the path, nothing is written and the answer says so. Useful for agents that pick a file name and must not clobber someone else's note.
 - **`op_id` makes retried writes safe (opt-in, CouchDB mode).** Set `OPS_DATABASE` to a database name and the write tools accept an `op_id`: a call repeated with the same id (an agent retrying after a timeout) returns the first answer instead of appending or writing again. Records live in that separate database, so they work across server instances and restarts and are never synced to Obsidian. Without `OPS_DATABASE` nothing changes and `op_id` is refused.
 
@@ -15,6 +17,7 @@
 - CouchDB mode: "create only" (`create_only`, a `Folder:create` permission, and the destination of `move_note`) is now checked by CouchDB itself, so it holds across several server instances on one database. Before, two instances creating the same note at once both succeeded and one silently overwrote the other.
 
 ### Tests
+- `npm run test:desk-answer`: the desk-answer plugin through the real changes feed: go and answer each fire once, an unrelated edit, a re-saved answer and a restart fire nothing, an answer made while the server was down fires once at startup.
 - `npm run test:new-item`: `ctx.store` against a real CouchDB (create-only, stale revision, a revision for a missing key, a failure that is not a conflict), then 20 concurrent calls of the example plugin through two server instances: 20 distinct numbers, every gap accounted for by an answer, 20 notes each holding its own caller's text, the counter at the highest number; a deleted item and a crash after a reservation don't bring a number back; the same `op_id` on both instances creates one note.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 
