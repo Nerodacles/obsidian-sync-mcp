@@ -144,7 +144,7 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 
 ## Tools (`src/tools.ts`)
 
-12 tools registered via FastMCP:
+17 tools registered via FastMCP:
 
 | Tool | Reads from | Writes to |
 |---|---|---|

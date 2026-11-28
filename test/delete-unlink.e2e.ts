@@ -29,7 +29,7 @@ import { join } from "node:path";
 const COUCH = (process.env.TEST_COUCHDB_URL ?? "http://localhost:5985").replace(/\/+$/, "");
 const COUCH_USER = process.env.TEST_COUCHDB_USER ?? "admin";
 const COUCH_PASSWORD = process.env.TEST_COUCHDB_PASSWORD ?? "test";
-const DB = "deleteunlinkvault";
+const DB = process.env.TEST_COUCHDB_DATABASE ?? "deleteunlinkvault";
 const AUTH = "delete-unlink-test-token";
 const PORT = 9891;
 const couchAuth = { Authorization: "Basic " + Buffer.from(`${COUCH_USER}:${COUCH_PASSWORD}`).toString("base64") };

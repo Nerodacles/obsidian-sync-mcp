@@ -61,7 +61,7 @@ import { join } from "node:path";
 const COUCH = (process.env.TEST_COUCHDB_URL ?? "http://localhost:5985").replace(/\/+$/, "");
 const COUCH_USER = process.env.TEST_COUCHDB_USER ?? "admin";
 const COUCH_PASSWORD = process.env.TEST_COUCHDB_PASSWORD ?? "test";
-const DB = "concurrencyvault";
+const DB = process.env.TEST_COUCHDB_DATABASE ?? "concurrencyvault";
 const AUTH = "concurrency-test-token";
 /** CONCURRENCY_INSTANCES=1 runs every worker against a single instance. */
 const INSTANCES = Number(process.env.CONCURRENCY_INSTANCES ?? 2);
