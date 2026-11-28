@@ -159,6 +159,9 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 | `get_note_metadata` | vault + index (backlinks) | — |
 | `move_note` | vault | vault + index |
 | `delete_note` | — | vault + index |
+| `list_conflicts` | vault (CouchDB `_find` on `_conflicts`) | — |
+| `get_conflict` | vault (every live leaf) | — |
+| `resolve_conflict` | vault | vault + index |
 
 `edit_note`, `set_properties` and `append_to_section` share one write path: a pure text function (`applyEdit`, or `src/structured-edits.ts`) passed to the backend's `updateNote`, which re-applies it to newer text when the revision check refuses the write (CouchDB mode); local mode reads, applies and writes once.
 

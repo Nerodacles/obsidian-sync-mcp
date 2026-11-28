@@ -1,7 +1,8 @@
 import type { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
-import { NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type VaultBackend } from "./vault-backend.js";
+import { ConflictChangedError, ConflictLeafUnreadableError, NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type ConflictLeaf, type VaultBackend } from "./vault-backend.js";
+import { diffLines, unifiedDiff } from "./line-diff.js";
 import { termWords, type SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
@@ -30,7 +31,7 @@ export function cleanSearchTerms(terms: string[] | undefined): string[] {
         .slice(0, SEARCH_MAX_TERMS);
 }
 
-const WRITE_TOOLS = ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note"] as const;
+const WRITE_TOOLS = ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "resolve_conflict"] as const;
 
 /**
  * edit_note rounds when another writer changes the note between its read and
@@ -48,6 +49,39 @@ export const EDIT_MIN_RETRY_MS = 3000;
 
 export const NO_REVISIONS_MESSAGE =
     "expected_revision needs CouchDB mode: this vault has no revisions. Nothing was written.";
+
+export const CONFLICTS_NEED_COUCHDB_MESSAGE =
+    "Conflicts exist only in CouchDB mode: this vault has no revisions, so a note can't have two live versions.";
+
+/**
+ * First line of read_note and get_note_metadata when the note has other live
+ * revision leaves in CouchDB. Agents can match on the leading "CONFLICT: ".
+ */
+export function conflictLine(others: number): string {
+    return `CONFLICT: ${others} other live version${others === 1 ? "" : "s"} of this note; see get_conflict.`;
+}
+
+/**
+ * get_conflict output bound: the diffs of all other versions together stay
+ * under this many characters (shared equally between them), so the answer
+ * stays inline in clients that move large tool results to a file.
+ */
+export const GET_CONFLICT_MAX_DIFF_CHARS = 30_000;
+/** Diff lines longer than this are cut. */
+export const GET_CONFLICT_MAX_LINE_CHARS = 500;
+
+/** A Markdown fence longer than any backtick run in the text. */
+function fenceFor(text: string): string {
+    const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+    return "`".repeat(Math.max(3, longest + 1));
+}
+
+function describeLeaf(leaf: ConflictLeaf): string {
+    const when = leaf.mtime ? `modified ${new Date(leaf.mtime).toISOString()}` : "modified (unknown)";
+    const notes = [leaf.deleted ? "a deletion (LiveSync marked the note deleted in this version)" : "", leaf.content === null ? "its text could not be read" : ""].filter(Boolean);
+    return `${leaf.revision}, ${when}, ${leaf.size} bytes${notes.length ? `; ${notes.join("; ")}` : ""}`;
+}
+
 
 /** Apply one edit_note operation to a note's text; throws EditRefused when it can't be applied. */
 export function applyEdit(existing: string, op: "append" | "prepend" | "replace", newContent: string, oldText?: string): string {
@@ -275,7 +309,8 @@ export function registerTools(
         name: "read_note",
         description:
             "Read the content of a note from the Obsidian vault. Returns the markdown content and a deep link to open it in Obsidian; in CouchDB mode also the note's revision, which write_note and edit_note accept as expected_revision. " +
-            "For a path that doesn't exist, it says so and lists notes with that file name or alias elsewhere, if any.",
+            "For a path that doesn't exist, it says so and lists notes with that file name or alias elsewhere, if any. " +
+            "When the note has other live versions in CouchDB (a sync conflict), the answer starts with a line 'CONFLICT: N other live versions of this note; see get_conflict.' and the text shown is only the version CouchDB picked.",
         _meta: { "anthropic/maxResultSizeChars": READ_NOTE_MAX_RESULT_SIZE_CHARS },
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
@@ -292,7 +327,8 @@ export function registerTools(
             }
             const deepLink = makeDeepLink(vaultName, path);
             const revisionLine = revised ? `\nRevision: ${revised.revision}` : "";
-            return `[Open in Obsidian](${deepLink})${revisionLine}\n\n---\n\n${content}`;
+            const conflict = revised?.conflicts?.length ? `${conflictLine(revised.conflicts.length)}\n` : "";
+            return `${conflict}[Open in Obsidian](${deepLink})${revisionLine}\n\n---\n\n${content}`;
         },
     });
 
@@ -690,7 +726,8 @@ export function registerTools(
     server.addTool({
         name: "get_note_metadata",
         description:
-            "Get metadata about a note without reading its full content. Returns frontmatter, tags, outgoing links, backlinks (notes that link to this one), size, and timestamps. Use this to navigate the knowledge graph.",
+            "Get metadata about a note without reading its full content. Returns frontmatter, tags, outgoing links, backlinks (notes that link to this one), size, and timestamps. Use this to navigate the knowledge graph. " +
+            "Starts with a 'CONFLICT: ' line, as read_note does, when the note has other live versions in CouchDB.",
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'projects/my-project.md'"),
         }),
@@ -701,6 +738,7 @@ export function registerTools(
             }
             const deepLink = makeDeepLink(vaultName, path);
             const lines = [
+                ...(meta.conflicts?.length ? [conflictLine(meta.conflicts.length)] : []),
                 `**${path}**`,
                 `Size: ${meta.size} bytes`,
                 `Created: ${new Date(meta.ctime).toISOString()}`,
@@ -727,6 +765,123 @@ export function registerTools(
                 lines.push(`\nBacklinks: ${backlinks.join(", ")}`);
             }
             lines.push(`\n[Open in Obsidian](${deepLink})`);
+            return lines.join("\n");
+        },
+    });
+
+    server.addTool({
+        name: "list_conflicts",
+        description:
+            "List notes that have more than one live version in CouchDB (a sync conflict, e.g. an Obsidian edit racing an agent edit), with how many other versions each has. " +
+            "Reads no note text. Use get_conflict on a listed note to see the versions and resolve_conflict to settle it.",
+        parameters: z.object({
+            folder: z.string().optional().describe("Folder to list, e.g. 'projects'. Omit for the whole vault."),
+        }),
+        execute: async ({ folder }) => {
+            if (!vault.listConflicts) return CONFLICTS_NEED_COUCHDB_MESSAGE;
+            const { conflicts, unreadable } = await vault.listConflicts(folder);
+            const scope = folder ? ` in ${folder.replace(/\/+$/, "")}/` : "";
+            const unreadableLine = unreadable ? `\n${unreadable} conflicted document${unreadable === 1 ? "" : "s"} could not be read (path not decryptable) and ${unreadable === 1 ? "is" : "are"} not listed.` : "";
+            if (conflicts.length === 0) return `No conflicted notes${scope}.${unreadableLine}`;
+            const lines = conflicts.map((c) =>
+                `- [${c.path}](${makeDeepLink(vaultName, c.path)}): ${c.conflicts.length} other live version${c.conflicts.length === 1 ? "" : "s"}, winner ${c.revision}`);
+            return [`${conflicts.length} conflicted note${conflicts.length === 1 ? "" : "s"}${scope}:`, ...lines].join("\n") + unreadableLine;
+        },
+    });
+
+    server.addTool({
+        name: "get_conflict",
+        description:
+            "Show a note's conflicting versions (CouchDB mode): the winner, which read_note shows, and every other live version as a line diff against the winner, each with its revision. " +
+            "The 'Leaves:' line is what resolve_conflict expects as expected_leaves. " +
+            `Diffs are cut to ${GET_CONFLICT_MAX_DIFF_CHARS} characters in total; pass revision to get one version's full text.`,
+        parameters: z.object({
+            path: z.string().describe("Vault-relative path to the note, e.g. 'projects/my-project.md'"),
+            revision: z.string().optional().describe("Optional: one version's revision from a previous get_conflict; returns that version's full text instead of the diffs."),
+        }),
+        execute: async ({ path, revision }) => {
+            if (!vault.getConflict) return CONFLICTS_NEED_COUCHDB_MESSAGE;
+            const detail = await vault.getConflict(path);
+            if (!detail) return `Note not found: ${path}`;
+            const leaves = [detail.winner, ...detail.others];
+            if (revision !== undefined) {
+                const leaf = leaves.find((l) => l.revision === revision);
+                if (!leaf) return `${path} has no live version ${revision}. Live versions: ${leaves.map((l) => l.revision).join(",")}`;
+                if (leaf.content === null) return `Version ${describeLeaf(leaf)}`;
+                return `Version ${describeLeaf(leaf)}\n\n---\n\n${leaf.content}`;
+            }
+            if (detail.others.length === 0) return `No conflict: ${path} has one live version (revision ${detail.winner.revision}).`;
+            const out = [
+                `Conflict: ${path} has ${leaves.length} live versions.`,
+                `Leaves: ${leaves.map((l) => l.revision).join(",")}`,
+                `Winner (what read_note shows): ${describeLeaf(detail.winner)}`,
+            ];
+            const budget = Math.floor(GET_CONFLICT_MAX_DIFF_CHARS / detail.others.length);
+            for (const leaf of detail.others) {
+                out.push("", `Other version: ${describeLeaf(leaf)}`);
+                if (leaf.content === null || detail.winner.content === null) {
+                    out.push("No diff: a version's text could not be read.");
+                    continue;
+                }
+                const { lines, omitted } = unifiedDiff(diffLines(detail.winner.content, leaf.content), { maxChars: budget, maxLineChars: GET_CONFLICT_MAX_LINE_CHARS });
+                if (lines.length === 0 && omitted === 0) {
+                    out.push("Same text as the winner.");
+                    continue;
+                }
+                const body = [`--- ${detail.winner.revision} (winner)`, `+++ ${leaf.revision}`, ...lines].join("\n");
+                const fence = fenceFor(body);
+                out.push(`${fence}diff`, body, fence);
+                if (omitted) out.push(`${omitted} more diff line${omitted === 1 ? "" : "s"} not shown; get_conflict with revision="${leaf.revision}" prints this version in full.`);
+            }
+            out.push(
+                "",
+                `To resolve: resolve_conflict with expected_leaves="${leaves.map((l) => l.revision).join(",")}" and either keep="<revision>" (that version's text, unchanged) or content="<merged text>". Every other version is then deleted.`,
+                `[Open in Obsidian](${makeDeepLink(vaultName, path)})`,
+            );
+            return out.join("\n");
+        },
+    });
+
+    if (!readOnly) server.addTool({
+        name: "resolve_conflict",
+        description:
+            "Settle a note's sync conflict (CouchDB mode): keep one version's text as it is (keep), or write merged text (content); either becomes the note's new revision and every other version is deleted. " +
+            "Pass the 'Leaves:' line of get_conflict as expected_leaves: if the versions changed since, nothing is written." + writeScopeNote,
+        parameters: z.object({
+            path: z.string().describe("Vault-relative path to the note, e.g. 'projects/my-project.md'"),
+            expected_leaves: z.string().describe("The comma-separated revisions from the 'Leaves:' line of get_conflict."),
+            keep: z.string().optional().describe("The revision of the version to keep unchanged. Give keep or content, not both."),
+            content: z.string().optional().describe("Merged full markdown text to write. Give keep or content, not both."),
+        }),
+        execute: async ({ path, expected_leaves, keep, content }) => {
+            const denied = checkWrite(path, "update", writeFolders);
+            if (denied) return denied;
+            if (!vault.resolveConflict) return CONFLICTS_NEED_COUCHDB_MESSAGE;
+            if ((keep === undefined) === (content === undefined)) return "Give exactly one of keep or content. Nothing was written.";
+            const expected = expected_leaves.split(",").map((r) => r.trim()).filter(Boolean);
+            if (keep !== undefined && !expected.includes(keep)) return `keep must be one of the revisions in expected_leaves (${expected.join(",")}). Nothing was written.`;
+            let result;
+            try {
+                result = await vault.resolveConflict(path, expected, keep !== undefined ? { keep } : { content: content! });
+            } catch (err) {
+                if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
+                if (err instanceof ConflictChangedError) {
+                    return `The versions of ${path} changed since get_conflict: live now ${err.current.join(",") || "(none)"}, not ${err.expected.join(",")}. Nothing was written; call get_conflict again.`;
+                }
+                if (err instanceof ConflictLeafUnreadableError) return `${err.message}. Nothing was written.`;
+                throw err;
+            }
+            if (result.removed.length === 0 && result.content === null && result.remaining.length === 0) {
+                return `No conflict: ${path} has one live version (revision ${result.revision}). Nothing was written.`;
+            }
+            if (result.content !== null) searchIndex.update(path, result.content, Date.now());
+            const lines = [
+                `${result.remaining.length ? "Conflict partly resolved" : "Conflict resolved"}: ${path}`,
+                `Revision: ${result.revision}`,
+                `Removed ${result.removed.length} other version${result.removed.length === 1 ? "" : "s"}${result.removed.length ? `: ${result.removed.join(",")}` : ""}`,
+            ];
+            if (result.remaining.length) lines.push(`Still live: ${result.remaining.join(",")} (changed while resolving); call get_conflict again.`);
+            lines.push(`[Open in Obsidian](${makeDeepLink(vaultName, path)})`);
             return lines.join("\n");
         },
     });

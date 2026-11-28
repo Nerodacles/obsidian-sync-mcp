@@ -213,6 +213,9 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | `delete_note` | Delete a note |
 | `move_note` | Move or rename a note — works across folders, creates destination folders automatically |
 | `get_note_metadata` | Get frontmatter, tags, outgoing links, backlinks, size, timestamps and (CouchDB mode) revision — navigate the knowledge graph |
+| `list_conflicts` | CouchDB mode: list notes with more than one live version (a sync conflict), with how many other versions each has; optional folder |
+| `get_conflict` | CouchDB mode: show a conflicted note's versions, each as a line diff against the one reads show, with their revisions; optional `revision` for one version's full text |
+| `resolve_conflict` | CouchDB mode: keep one version as it is, or write merged text, and delete every other version; refuses if the versions changed since `get_conflict` |
 
 ### Properties and sections
 
@@ -295,6 +298,16 @@ With `OPS_DATABASE` set, `write_note`, `edit_note`, `delete_note` and `move_note
 - Languages written without spaces between words (Chinese, Japanese) are matched by runs of characters, so search for a whole run.
 
 With `SEARCH_DEFAULT_EXCLUDE` set, notes in those folders are left out unless the `folder` parameter points inside one of them. The status line then says which folders were left out and how many matching notes they held, so a hit is never hidden silently.
+### Sync conflicts (CouchDB mode)
+
+LiveSync replication never gets a "document changed" refusal, so when Obsidian and an agent both edit a note from the same revision, CouchDB keeps both as live revision leaves and picks one as the winner by revision id. Every read shows only the winner; the other version stays in the database until someone resolves it.
+
+- `read_note` and `get_note_metadata` start with one extra line when the note has other live versions: `CONFLICT: 1 other live version of this note; see get_conflict.` (`2 other live versions` and so on). Agents can match on the leading `CONFLICT: `. A note without a conflict gets exactly the answer it got before.
+- `list_conflicts` lists the conflicted notes. It is one Mango `_find` on `_conflicts` (paged): CouchDB checks every document in the database for it, but sends back only the conflicted ones, without note text or chunks, and each of those is then read once, metadata only. No index is created, since that would write a design document into the vault database that every LiveSync device replicates.
+- `get_conflict` prints a `Leaves:` line (every live revision, the winner first), then each other version as a unified line diff against the winner (`-` winner, `+` that version, two lines of context). The diffs share a 30,000-character budget and lines are cut at 500 characters; what is cut is counted, and `get_conflict` with `revision` returns one version's full text. A version that is a LiveSync deletion, or whose text can't be read, is marked as such.
+- `resolve_conflict` takes the `Leaves:` line back as `expected_leaves` and either `keep` (a revision: that version's text, unchanged) or `content` (merged text). If the live versions are not exactly those, nothing is written. Otherwise the text is written as a new revision on top of the winner (nothing is written when keeping the winner), revision-checked, and then every other version is deleted at its own revision. A version that changes between those steps is left in place and reported as still live. It needs the same `WRITE_FOLDERS` `update` permission as `edit_note`, and is not available under `READ_ONLY`.
+
+Local mode has no revisions and so no conflicts: the three tools answer that they need CouchDB mode, and reads are unchanged. Conflicts on attachments are not listed.
 
 ### Attachments (opt-in)
 
@@ -370,7 +383,7 @@ Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable fo
 | `DISPLAY_TIMEZONE` | Optional | server's zone | IANA time zone for the human-readable half of the server time in `search_notes` status lines (UTC is always printed beside it), e.g. `Europe/Berlin`. An invalid zone falls back to UTC with a warning at startup |
 | `SEARCH_DEFAULT_EXCLUDE` | Optional | — | Comma-separated folders that `search_notes` leaves out by default, e.g. `Archive,Templates`. Matching is folder-boundary-aware (`Archive` leaves out `Archive/old.md`, not `Archived/x.md`). A search whose `folder` lies inside an excluded folder searches it. While set, the status line of every search says which folders were left out and how many matching notes they held. Unset or empty: every folder is searched |
 | `MCP_REFRESH_DAYS` | Optional | `14` | Days before auth session expires |
-| `READ_ONLY` | Optional | `false` | Set to `true` to disable all write tools (`write_note`, `edit_note`, `set_properties`, `append_to_section`, `delete_note`, `move_note`). Only read tools are exposed via MCP, and the vault backend rejects writes as well. Useful when sharing the server with multiple AI clients and write access should be opt-in. This protects the vault from MCP clients; it is not a database-level guarantee. To make CouchDB itself refuse writes, use CouchDB-side controls, such as a `validate_doc_update` function that rejects the server's CouchDB user. |
+| `READ_ONLY` | Optional | `false` | Set to `true` to disable all write tools (`write_note`, `edit_note`, `set_properties`, `append_to_section`, `delete_note`, `move_note`, `resolve_conflict`). Only read tools are exposed via MCP, and the vault backend rejects writes as well. Useful when sharing the server with multiple AI clients and write access should be opt-in. This protects the vault from MCP clients; it is not a database-level guarantee. To make CouchDB itself refuse writes, use CouchDB-side controls, such as a `validate_doc_update` function that rejects the server's CouchDB user. |
 | `PLUGIN_DIR` | Optional | — | Directory of plugins: every `.js`/`.mjs` file in it adds tools at startup. See [Plugins](#plugins-opt-in). Unset: no plugins. |
 | `OPS_DATABASE` | Optional | — | CouchDB mode. Name of a separate CouchDB database for `op_id` records (created at startup if missing, which needs a user allowed to create databases; otherwise create it once as admin and give the server's user access). Never the vault database. Unset: `op_id` is refused and nothing else changes. |
 | `WRITE_FOLDERS` | Optional | — | Comma-separated list of vault-relative folders where agents may write (e.g. `MCP,Inbox`). The whole vault stays readable; paths outside the listed folders are read-only. Add permissions after a colon to limit a folder: `create` (add new files), `update` (change existing files) and `delete` (delete files or move them away), joined with `+`. A folder without permissions gets all three. For example `MCP,Raw:create,Notes:create+update`: anything goes in `MCP`, agents can add to `Raw` but never overwrite, edit, move or delete what is there, and can add and edit in `Notes` but not delete. `move_note` and `move_attachment` need `delete` at the source and `create` at the destination, and never replace an existing note. An attachment is replaced only with `overwrite=true`, which needs both `create` and `update`, so attachments can't be replaced in an `update`-only folder. The most specific folder applies, so `Raw:create,Raw/scratch` makes `Raw/scratch` fully writable; `/` stands for the vault root (`/,Raw:create` makes everything writable except `Raw`). Matching is folder-boundary-aware (`MCP` matches `MCP/note.md` but not `MCP-private/note.md`). Paths are compared the way the vault resolves them: `\` counts as `/`, and a case variant of a folder (`raw/`) gets only what both spellings allow, since LiveSync, macOS and Windows treat them as one folder. The server refuses to start on an unknown permission, a folder listed twice (case variants included) or a folder that can never match. Enforced server-side, unlike `MCP_INSTRUCTIONS`; in local mode, writes, deletes and moves through a symlink (to a file or a folder) are refused while it is set, since the check sees the requested path; reads still follow symlinks. Ignored when `READ_ONLY=true`; unset or empty means the whole vault is writable. |
@@ -413,7 +426,7 @@ Set transport to **Streamable HTTP**, enter `http://localhost:8787/mcp`, and con
 
 - **Single vault per instance.** Each server connects to one vault. For multiple vaults, run multiple instances on different ports.
 - **Single machine on Fly.io.** Auth state is in-memory, so multiple machines break the OAuth flow. The setup script enforces this automatically.
-- **No conflict resolution.** If an agent and Obsidian edit the same note simultaneously, last write wins. In CouchDB mode, concurrent `edit_note` calls through this server (one instance or several) don't overwrite each other, and `write_note` replacing an existing note doesn't leave a hidden conflict revision; creating a note, `delete_note` and `move_note` are not revision-checked. See [Concurrent edits](#concurrent-edits-couchdb-mode).
+- **Conflicts are resolved by an agent or in Obsidian, not automatically.** If an agent and Obsidian edit the same note at the same time, CouchDB keeps both versions and reads show one of them; the server flags such notes and `resolve_conflict` settles them ([Sync conflicts](#sync-conflicts-couchdb-mode)). Agents editing through this server (one instance or several) don't overwrite each other in CouchDB mode; see [Concurrent edits](#concurrent-edits-couchdb-mode).
 - **Attachments are write-and-describe only.** With `ATTACHMENTS_ENABLED=true` agents can store, move and delete media files, but the server does not return attachment contents to the model.
 - **Deep links depend on the client.** Obsidian `obsidian://` deep links are included in every tool response. They work on Claude Mobile and in browsers, but some clients (Claude Desktop) may not render them as clickable links.
 - **Node 22+ required.**
@@ -446,6 +459,7 @@ npm install && npm run build
 npm test              # unit tests
 npm run test:e2e      # integration tests
 npm run test:couchdb  # CouchDB harness (needs a throwaway CouchDB on localhost:5985)
+npm run test:conflicts # makes real CouchDB conflicts, then lists, shows and resolves them (same CouchDB)
 npm run test:smoke    # full smoke test: built server over MCP against CouchDB, all vault configurations
 ```
 
