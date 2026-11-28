@@ -510,10 +510,15 @@ export function registerTools(
             }
 
             // Backlinks are keyed by path and by name; the name with .md also
-            // catches a markdown link written as a bare file name.
+            // catches a markdown link written as a bare file name, and each
+            // shorter tail of the path a partial one ([[Projects/Garden plan]]
+            // for Work/Projects/Garden plan.md). unlinkLinks then decides which
+            // of their links really resolve to the note.
             const notes = searchIndex.listPaths();
             if (!notes.some((n) => n.toLowerCase() === path.toLowerCase())) notes.push(path);
-            const linkers = [...new Set([...searchIndex.getBacklinks(path), ...searchIndex.getBacklinks(noteName(path) + ".md")])]
+            const segments = path.split("/");
+            const keys = [path, noteName(path) + ".md", ...segments.slice(1, -1).map((_, i) => segments.slice(i + 1).join("/"))];
+            const linkers = [...new Set(keys.flatMap((k) => searchIndex.getBacklinks(k)))]
                 .filter((p) => p.toLowerCase() !== path.toLowerCase())
                 .sort();
             let unlinkedNotes = 0;

@@ -15,6 +15,10 @@
  *             get_note_metadata of each linker lists no link to it, and the
  *             linkers read straight from CouchDB have no conflict leaf.
  *   keep      the same with unlink=false: both links are left in place.
+ *   race      DELETE_UNLINK_ROUNDS (default 5) rounds: 10 edit_note appends to a
+ *             linking note race one delete_note of the note it links to. Every
+ *             appended line must be present and the link gone (lines are
+ *             counted: a lost append leaves no conflict leaf to see).
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -39,33 +43,41 @@ function parseSSE(raw: string): any {
     return JSON.parse(raw);
 }
 
-let session = "";
-async function post(body: unknown): Promise<Response> {
-    return await fetch(`http://localhost:${PORT}/mcp`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "Authorization": `Bearer ${AUTH}`,
-            ...(session ? { "mcp-session-id": session } : {}),
-        },
-        body: JSON.stringify(body),
-    });
+/** One MCP session; concurrent calls each get their own, as in the concurrency harness. */
+class Client {
+    private session = "";
+
+    private async post(body: unknown): Promise<Response> {
+        return await fetch(`http://localhost:${PORT}/mcp`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": `Bearer ${AUTH}`,
+                ...(this.session ? { "mcp-session-id": this.session } : {}),
+            },
+            body: JSON.stringify(body),
+        });
+    }
+
+    async connect(): Promise<this> {
+        const resp = await this.post({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "delete-unlink", version: "1.0" } } });
+        if (!resp.ok) throw new Error(`initialize: ${resp.status}`);
+        this.session = resp.headers.get("mcp-session-id") ?? "";
+        await resp.text();
+        return this;
+    }
+
+    async tool(name: string, args: Record<string, unknown>): Promise<string> {
+        const resp = parseSSE(await (await this.post({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } })).text());
+        const text = resp?.result?.content?.[0]?.text;
+        if (typeof text !== "string") throw new Error(`${name}: no text in ${JSON.stringify(resp).slice(0, 300)}`);
+        return text;
+    }
 }
 
-async function connect(): Promise<void> {
-    const resp = await post({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "delete-unlink", version: "1.0" } } });
-    if (!resp.ok) throw new Error(`initialize: ${resp.status}`);
-    session = resp.headers.get("mcp-session-id") ?? "";
-    await resp.text();
-}
-
-async function tool(name: string, args: Record<string, unknown>): Promise<string> {
-    const resp = parseSSE(await (await post({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } })).text());
-    const text = resp?.result?.content?.[0]?.text;
-    if (typeof text !== "string") throw new Error(`${name}: no text in ${JSON.stringify(resp).slice(0, 300)}`);
-    return text;
-}
+let main: Client;
+const tool = (name: string, args: Record<string, unknown>) => main.tool(name, args);
 
 /** The note's text from a read_note answer (after the header block). */
 async function readBody(path: string): Promise<string | null> {
@@ -127,6 +139,31 @@ async function scenario(name: string, folder: string, unlink: boolean | undefine
     }
 }
 
+async function race(rounds: number) {
+    const workers = await Promise.all(Array.from({ length: 11 }, () => new Client().connect()));
+    let lost = 0;
+    let linked = 0;
+    for (let r = 0; r < rounds; r++) {
+        const target = `e2e-race/${r}/Garden plan.md`;
+        const linker = `e2e-race/${r}/Log.md`;
+        assert.match(await tool("write_note", { path: target, content: "x\n" }), /^Note saved/);
+        assert.match(await tool("write_note", { path: linker, content: `See [[e2e-race/${r}/Garden plan|the plan]]\n` }), /^Note saved/);
+        const appends = Array.from({ length: 10 }, (_, i) => `line-${r}-${i}`);
+        const answers = await Promise.all([
+            workers[0].tool("delete_note", { path: target }),
+            ...appends.map((line, i) => workers[i + 1].tool("edit_note", { path: linker, content: line })),
+        ]);
+        for (const a of answers.slice(1)) assert.match(a, /^Note edited/, a);
+        const text = (await readBody(linker)) ?? "";
+        const missing = appends.filter((l) => !text.includes(l)).length;
+        lost += missing;
+        if (text.includes("[[")) linked++;
+        if (missing > 0 || text.includes("[[")) console.log(`    round ${r}: ${missing} appends missing; ${answers[0].split("\n").slice(0, 3).join(" | ")}`);
+    }
+    check("race appends", lost === 0, `${lost} of ${rounds * 10} appends missing after racing delete_note`);
+    check("race unlinked", linked === 0, `${linked} of ${rounds} rounds still hold the link`);
+}
+
 await fetch(`${COUCH}/${DB}`, { method: "DELETE", headers: couchAuth });
 const created = await fetch(`${COUCH}/${DB}`, { method: "PUT", headers: couchAuth });
 if (!created.ok) throw new Error(`could not create ${DB}: ${created.status}`);
@@ -154,12 +191,13 @@ try {
     const start = Date.now();
     for (;;) {
         if (proc.exitCode !== null) throw new Error(`server exited:\n${logs}`);
-        try { await connect(); break; } catch { /* not ready */ }
+        try { main = await new Client().connect(); break; } catch { /* not ready */ }
         if (Date.now() - start > 30000) throw new Error(`server did not start:\n${logs}`);
         await new Promise((r) => setTimeout(r, 250));
     }
     await scenario("unlink", "e2e-unlink", undefined);
     await scenario("keep", "e2e-keep", false);
+    await race(Number(process.env.DELETE_UNLINK_ROUNDS ?? 5));
 } finally {
     proc.kill("SIGTERM");
     await new Promise((r) => setTimeout(r, 500));

@@ -110,6 +110,24 @@ describe("delete_note", () => {
         assert.deepEqual(searchIndex.getBacklinks(TARGET), []);
     });
 
+    it("finds and unlinks a partial-path link, and leaves one that resolves to another note", async () => {
+        const deep = "Work/Projects/Garden plan.md";
+        const { vault, call } = await setup({
+            [deep]: "x\n",
+            "A/partial.md": "[[Projects/Garden plan|p]] [q](Projects/Garden%20plan.md)\n",
+            "Other/Projects/Garden plan.md": "y\n",
+            "B/exact.md": "[[Other/Projects/Garden plan]]\n",
+        });
+        const answer = await call({ path: deep });
+        // Two notes end with Projects/Garden plan: the partial link is ambiguous and stays.
+        assert.equal(await vault.readNote("A/partial.md"), "[[Projects/Garden plan|p]] [q](Projects/Garden%20plan.md)\n");
+        assert.match(answer, /^- Unchanged: A\/partial\.md, no link in it needs removing; 2 links left as written, since several notes share that name$/m);
+        assert.equal(await vault.readNote("B/exact.md"), "[[Other/Projects/Garden plan]]\n");
+        const solo = await setup({ [deep]: "x\n", "A/partial.md": "[[Projects/Garden plan|p]] [q](Projects/Garden%20plan.md)\n" });
+        await solo.call({ path: deep });
+        assert.equal(await solo.vault.readNote("A/partial.md"), "p q\n");
+    });
+
     it("unlink=false deletes the note and leaves every link", async () => {
         const { vault, call } = await setup(THREE);
         assert.equal(await call({ path: TARGET, unlink: false }), `Deleted: ${TARGET}`);
