@@ -50,8 +50,8 @@ export const NO_REVISIONS_MESSAGE =
 /** An edit that can't be applied to the note's current text. */
 class EditRefused extends Error {}
 
-/** delete_note: a linking note's fresh text no longer holds a link to remove, so nothing is written. */
-class NothingToUnlink extends Error {}
+/** delete_note and rename_note: a linking note's fresh text no longer holds a link to change, so nothing is written. */
+class NoLinkLeft extends Error {}
 
 /** Apply one edit_note operation to a note's text; throws EditRefused when it can't be applied. */
 export function applyEdit(existing: string, op: "append" | "prepend" | "replace", newContent: string, oldText?: string): string {
@@ -557,11 +557,11 @@ export function registerTools(
                         try {
                             await vault.updateNote(linker, (fresh) => {
                                 result = unlinkLinks(fresh, ctx);
-                                if (result.unlinked === 0) throw new NothingToUnlink();
+                                if (result.unlinked === 0) throw new NoLinkLeft();
                                 return result.content;
                             }, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
                         } catch (err) {
-                            if (err instanceof NothingToUnlink) {
+                            if (err instanceof NoLinkLeft) {
                                 unchanged++;
                                 details.push(`- Unchanged: ${linker}, its links were removed by another writer${describeLeftovers(result)}`);
                                 continue;
@@ -720,31 +720,56 @@ export function registerTools(
                         details.push(`- Not rewritten: ${path}, the note is gone`);
                         continue;
                     }
-                    const result = rewriteLinks(text, { from, to, notesBefore, sourceBefore: path, sourceAfter: path });
-                    const ambiguous = result.ambiguous > 0 ? `; ${plural(result.ambiguous, "link")} left as written, since several notes share that name` : "";
-                    if (result.rewritten === 0) {
+                    const ctx = { from, to, notesBefore, sourceBefore: path, sourceAfter: path };
+                    const first = rewriteLinks(text, ctx);
+                    const ambiguousOf = (r: { ambiguous: number }) => r.ambiguous > 0 ? `; ${plural(r.ambiguous, "link")} left as written, since several notes share that name` : "";
+                    if (first.rewritten === 0) {
                         unchanged++;
-                        details.push(`- Unchanged: ${path}, no link in it needs rewriting${ambiguous}`);
+                        details.push(`- Unchanged: ${path}, no link in it needs rewriting${ambiguousOf(first)}`);
                         continue;
                     }
                     const refused = checkWrite(path, "update", writeFolders);
                     if (refused) {
                         skipped++;
-                        details.push(`- Not rewritten: ${path} (${plural(result.rewritten, "link")}), no update permission: ${refused}`);
+                        details.push(`- Not rewritten: ${path} (${plural(first.rewritten, "link")}), no update permission: ${refused}`);
                         continue;
                     }
-                    if (!(await vault.writeNote(path, result.content, { mode: "update" }))) {
+                    let result = first;
+                    if (vault.updateNote) {
+                        // CouchDB mode: written only at the revision it was read
+                        // at, re-applied to the newer text when another writer
+                        // got in between, so no concurrent edit is overwritten.
+                        try {
+                            await vault.updateNote(path, (fresh) => {
+                                result = rewriteLinks(fresh, ctx);
+                                if (result.rewritten === 0) throw new NoLinkLeft();
+                                return result.content;
+                            }, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
+                        } catch (err) {
+                            if (err instanceof NoLinkLeft) {
+                                unchanged++;
+                                details.push(`- Unchanged: ${path}, its links were changed by another writer${ambiguousOf(result)}`);
+                                continue;
+                            }
+                            throw err;
+                        }
+                    } else if (!(await vault.writeNote(path, first.content, { mode: "update" }))) {
                         skipped++;
-                        details.push(`- Not rewritten: ${path} (${plural(result.rewritten, "link")}), the write failed`);
+                        details.push(`- Not rewritten: ${path} (${plural(first.rewritten, "link")}), the write failed`);
                         continue;
                     }
                     searchIndex.update(path, result.content, Date.now());
                     rewrittenNotes++;
                     rewrittenLinks += result.rewritten;
-                    details.push(`- Rewritten: ${path} (${plural(result.rewritten, "link")})${ambiguous}`);
+                    details.push(`- Rewritten: ${path} (${plural(result.rewritten, "link")})${ambiguousOf(result)}`);
                 } catch (err) {
                     skipped++;
-                    details.push(`- Not rewritten: ${path}, ${err instanceof NoteNotFoundError ? "the note is gone" : `error: ${(err as Error).message}`}`);
+                    const why = err instanceof NoteNotFoundError
+                        ? "the note is gone"
+                        : err instanceof UpdateRetriesExhaustedError
+                            ? `it kept changing during ${err.attempts} attempts`
+                            : `error: ${(err as Error).message}`;
+                    details.push(`- Not rewritten: ${path}, ${why}`);
                 }
             }
             if (update_links === false) {

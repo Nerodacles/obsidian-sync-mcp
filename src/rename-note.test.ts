@@ -7,6 +7,7 @@ import { LocalVault } from "./vault-local.js";
 import { SearchIndex } from "./search.js";
 import { parseWriteFolders } from "./write-scope.js";
 import { registerTools } from "./tools.js";
+import type { VaultBackend } from "./vault-backend.js";
 
 describe("rename_note", () => {
     let dir: string;
@@ -18,7 +19,7 @@ describe("rename_note", () => {
     });
 
     /** A local vault holding `notes`, indexed, with the tools registered. */
-    async function setup(notes: Record<string, string>, writeFolders: string | null = null) {
+    async function setup(notes: Record<string, string>, writeFolders: string | null = null, wrap?: (v: VaultBackend) => VaultBackend) {
         const root = await mkdtemp(join(dir, "v-"));
         const vault = new LocalVault(root);
         const searchIndex = new SearchIndex();
@@ -28,7 +29,7 @@ describe("rename_note", () => {
         }
         searchIndex.state = "ready";
         const tools: any[] = [];
-        registerTools({ addTool: (t: any) => tools.push(t) } as any, vault, searchIndex, "vault", false, writeFolders === null ? null : parseWriteFolders(writeFolders));
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, wrap ? wrap(vault) : vault, searchIndex, "vault", false, writeFolders === null ? null : parseWriteFolders(writeFolders));
         const call = (args: any): Promise<string> => {
             const tool = tools.find((t) => t.name === "rename_note");
             assert.ok(tool, "rename_note registered");
@@ -173,6 +174,47 @@ describe("rename_note", () => {
         const answer = await call({ from: FROM, to: TO });
         assert.equal(await vault.readNote("Journal/Monday.md"), "[[Garden plan]]\n");
         assert.match(answer, /^- Unchanged: Journal\/Monday\.md, no link in it needs rewriting; 1 link left as written, since several notes share that name$/m);
+    });
+
+    it("re-applies the rewrite when the linking note changes between read and write, keeping both", async () => {
+        const seen: string[] = [];
+        const edited = "See [[Garden plan|the plan]] today.\nA line someone else added\n";
+        const { vault, call } = await setup({ [FROM]: NOTE, "Journal/Monday.md": "See [[Garden plan|the plan]] today.\n" }, null, (local) => {
+            const v = Object.create(local) as VaultBackend;
+            // A fake revision-checked update: the first attempt loses to a
+            // concurrent edit, so apply runs again on the edited text.
+            v.updateNote = async (path, apply) => {
+                seen.push(apply((await local.readNote(path))!));
+                await local.writeNote(path, edited, { mode: "update" });
+                const content = apply(edited);
+                seen.push(content);
+                await local.writeNote(path, content, { mode: "update" });
+                return { content, revision: "2-ab", attempts: 2 };
+            };
+            return v;
+        });
+        const answer = await call({ from: FROM, to: TO });
+        assert.deepEqual(seen, ["See [[Spring planting|the plan]] today.\n", "See [[Spring planting|the plan]] today.\nA line someone else added\n"]);
+        assert.equal(await vault.readNote("Journal/Monday.md"), "See [[Spring planting|the plan]] today.\nA line someone else added\n");
+        assert.match(answer, /^- Rewritten: Journal\/Monday\.md \(1 link\)$/m);
+    });
+
+    it("writes nothing when the newer text has no link left to rewrite", async () => {
+        let applied = 0;
+        const { vault, call } = await setup({ [FROM]: NOTE, "Journal/Monday.md": "[[Garden plan]]\n" }, null, (local) => {
+            const v = Object.create(local) as VaultBackend;
+            v.updateNote = async (_path, apply) => {
+                applied++;
+                apply("the link is gone\n");
+                throw new Error("apply should have refused");
+            };
+            return v;
+        });
+        const answer = await call({ from: FROM, to: TO });
+        assert.equal(applied, 1);
+        assert.equal(await vault.readNote("Journal/Monday.md"), "[[Garden plan]]\n");
+        assert.match(answer, /^- Unchanged: Journal\/Monday\.md, its links were changed by another writer$/m);
+        assert.match(answer, /^Links: 0 links rewritten in 0 notes; 0 not rewritten; 1 unchanged\.$/m);
     });
 
     it("updates the index: backlinks follow the new path", async () => {
