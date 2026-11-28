@@ -59,6 +59,19 @@ function stubVault({ caseSensitive = false } = {}) {
             return docs.delete(id(p));
         },
         liveSyncLocalDB: {
+            localDatabase: {
+                get: async (docId: string) => {
+                    await tick();
+                    const d = docs.get(docId);
+                    if (!d) throw Object.assign(new Error("missing"), { status: 404 });
+                    return { ...d };
+                },
+            },
+            getDBEntryMeta: async (p: string) => {
+                await tick();
+                const d = docs.get(id(p));
+                return d ? { ...d } : false;
+            },
             // Like CouchDB: stored only if the note is still at baseRevision, otherwise false (a 409).
             putDBEntryWithLiveBaseRevision: async (doc: { _id: string; path: string; data: Blob; ctime: number; mtime: number; size: number }, baseRevision: string) => {
                 calls.push(`put@rev ${doc.path}`);
@@ -70,8 +83,8 @@ function stubVault({ caseSensitive = false } = {}) {
                 if (event === "delete") docs.delete(doc._id);
                 if (event === "fail") return false;
                 const now = docs.get(doc._id);
-                if (!now || now._rev !== baseRevision) return false;
-                const rev = nextRev(now._rev);
+                if (now?._rev !== baseRevision) return false;
+                const rev = nextRev(now?._rev);
                 docs.set(doc._id, { path: doc.path, data: [text], ctime: doc.ctime, mtime: doc.mtime, size: doc.size, _rev: rev });
                 return { ok: true, id: doc._id, rev };
             },
@@ -80,9 +93,14 @@ function stubVault({ caseSensitive = false } = {}) {
     const vault = new Vault({ couchdbUrl: "http://stub", couchdbUser: "u", couchdbPassword: "p", database: "stub" });
     (vault as any).manipulator = manipulator;
     const seed = (p: string, text: string, ctime = 1) => docs.set(id(p), { path: p, data: [text], ctime, mtime: ctime, size: text.length, _rev: nextRev() });
+    const otherInstance = () => {
+        const v = new Vault({ couchdbUrl: "http://stub", couchdbUser: "u", couchdbPassword: "p", database: "stub" });
+        (v as any).manipulator = manipulator;
+        return v;
+    };
     const revOf = (p: string) => docs.get(id(p))?._rev;
     const textOf = (p: string) => docs.get(id(p))?.data.join("");
-    return { vault, docs, calls, seed, beforePut, revOf, textOf };
+    return { vault, docs, calls, seed, otherInstance, beforePut, revOf, textOf };
 }
 
 describe("Vault.writeNote modes (stubbed manipulator)", () => {
@@ -100,6 +118,16 @@ describe("Vault.writeNote modes (stubbed manipulator)", () => {
         seed("Raw/a.md", "v1");
         await assert.rejects(() => vault.writeNote("Raw/a.md", "v2", { mode: "create" }), (e: any) => e instanceof NoteExistsError && e.path === "Raw/a.md");
         assert.ok(!calls.some((c) => c.startsWith("put")), calls.join(", "));
+    });
+
+    it("create holds across two instances that don't share a lock", async () => {
+        const { vault, docs, otherInstance } = stubVault();
+        const other = otherInstance();
+        const results = await Promise.allSettled([vault.writeNote("Raw/n.md", "a", { mode: "create" }), other.writeNote("Raw/n.md", "b", { mode: "create" })]);
+        assert.deepEqual(results.map((r) => r.status).sort(), ["fulfilled", "rejected"]);
+        const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+        assert.ok(rejected.reason instanceof NoteExistsError, String(rejected.reason));
+        assert.equal(docs.get("raw/n.md")?.data.join(""), results[0].status === "fulfilled" ? "a" : "b");
     });
 
     it("create sees a case variant as the same note on a case-insensitive vault", async () => {
@@ -151,7 +179,7 @@ describe("Vault.moveNote never replaces (stubbed manipulator)", () => {
         assert.deepEqual([...docs.keys()], ["b/sub/n.md"]);
         assert.equal(docs.get("b/sub/n.md")?.path, "B/sub/n.md");
         assert.equal(docs.get("b/sub/n.md")?.data.join(""), "body");
-        assert.deepEqual(calls.filter((c) => !c.startsWith("get")), ["put B/sub/n.md", "delete A/n.md"]);
+        assert.deepEqual(calls.filter((c) => !c.startsWith("get")), ["put@rev B/sub/n.md", "delete A/n.md"]);
     });
 
     it("refuses an existing destination and deletes nothing", async () => {
@@ -355,10 +383,10 @@ describe("Vault.writeNote overwrites through the revision check (stubbed manipul
         assert.equal(upd.docs.size, 0);
     });
 
-    it("creating an absent note is unchanged: the plain put, no revision", async () => {
+    it("creating an absent note: an upsert is the plain put, create mode the CouchDB-checked put", async () => {
         const { vault, calls } = stubVault();
         assert.equal(await vault.writeNote("n.md", "fresh"), true);
         assert.equal(await vault.writeNote("m.md", "fresh", { mode: "create" }), true);
-        assert.deepEqual(calls.filter((c) => c.startsWith("put")), ["put n.md", "put m.md"]);
+        assert.deepEqual(calls.filter((c) => c.startsWith("put")), ["put n.md", "put@rev m.md"]);
     });
 });

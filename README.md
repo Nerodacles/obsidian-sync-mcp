@@ -202,7 +202,7 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 | Tool | Description |
 |---|---|
 | `read_note` | Read a note's markdown content by path (CouchDB mode: with its revision) |
-| `write_note` | Create or overwrite a note (replaces entire content); optional `expected_revision` |
+| `write_note` | Create or overwrite a note (replaces entire content); optional `expected_revision`; `create_only: true` refuses to replace an existing note |
 | `edit_note` | Edit a note without rewriting it — append, prepend (after frontmatter), or replace exact text; optional `expected_revision` |
 | `list_folders` | List all folders in the vault with note counts — use to discover folder names |
 | `list_tags` | List all tags in the vault with counts — use to discover tags before filtering |
@@ -222,6 +222,50 @@ Several agents, or several server instances on one database, can edit the same n
 - `write_note` and `edit_note` accept an optional `expected_revision`: the write only happens if the note is still at that revision; otherwise nothing is written and the answer names the current revision. `edit_note` with `expected_revision` does not retry.
 
 Local mode has no revisions: reads show none, and `expected_revision` is refused rather than ignored. `delete_note` and `move_note` do not check revisions yet (except a case-only rename on a case-insensitive vault, which rewrites the one note like `write_note`). Edits made in Obsidian reach CouchDB through LiveSync replication, which has no revision check; an Obsidian edit racing an agent edit is still left to LiveSync's conflict handling.
+
+### Plugins (opt-in)
+
+Set `PLUGIN_DIR` to load extra tools at startup. Each `.js` or `.mjs` file directly in that directory (a symlink to a file counts, as in a Kubernetes ConfigMap volume), in name order, default-exports a function that receives a context:
+
+```js
+// plugins/add-task.mjs
+export default function register(ctx) {
+    ctx.addTool({
+        name: "add_task",
+        description: "Append a task to a note.",
+        parameters: ctx.z.object({ path: ctx.z.string(), task: ctx.z.string() }),
+        execute: async ({ path, task }) => {
+            await ctx.vault.editNote(path, (text) => `${text}\n- [ ] ${task}`);
+            return `Added to ${path}`;
+        },
+    });
+}
+```
+
+`ctx.vault` offers `readNote`, `getMetadata`, `listNotes`, `writeNote` (with `createOnly`), `editNote`, `deleteNote` and `moveNote`. Its writes pass the same checks as the built-in tools — `READ_ONLY`, `WRITE_FOLDERS` with its create/update/delete permissions — use the same write path, and keep the search index current; a refused write is returned to the agent as the tool's answer. Startup fails if a plugin doesn't load, throws, or adds a tool whose name is already taken. Plugins run inside the server process with its rights: the context gives no way around the checks, but install only code you trust as much as the server.
+
+A refused write throws a `PluginWriteError` whose `code` says why: `exists` (a create-only write found a note there), `denied` (`WRITE_FOLDERS`), `read_only`, `not_found`, `revision_mismatch`, `unsupported` or `failed`. A plugin that doesn't catch it returns its message to the agent; one that does can react, for example by trying another path on `exists`.
+
+A tool added with `writes: true` is treated like the built-in write tools: with `OPS_DATABASE` it takes `op_id` (a retry with the same id and arguments returns the first answer without running again, on any instance), and `READ_ONLY` leaves it out. Its parameters must be a `z.object` that doesn't declare `op_id` itself. Tools without the flag take no `op_id`.
+
+**`ctx.store` (with `OPS_DATABASE`).** A plugin that needs state shared by every server instance on the vault (a counter, a marker) gets a small key/value store, kept in the `OPS_DATABASE` database next to the `op_id` records and never synced to Obsidian. It is present only when `OPS_DATABASE` is set and the server isn't `READ_ONLY`; otherwise `ctx.store` is `undefined`, so check before using it.
+
+```js
+const cur = await ctx.store.get("counter");             // { value, revision } or null
+const res = await ctx.store.put("counter", (cur?.value ?? 0) + 1, cur?.revision ?? null);
+if (res.conflict) { /* someone else wrote first: res.current is what is there now (or null) */ }
+```
+
+- `get(key)` returns `{ value, revision }`, or `null` when the key has no value.
+- `put(key, value, expectedRevision)` writes only if the key is still at `expectedRevision`; `null` means "only if the key has no value yet". It returns `{ revision }`, or `{ conflict: true, current }` with what is there now, so the plugin can decide again. That compare-and-swap is the only concurrency control: no locks, no transactions across keys.
+- Keys are 1-128 characters of `A-Z a-z 0-9 . _ -`. Each plugin file has its own keys (stored as `plugin:<file name>:<key>`), so two plugins can't see or overwrite each other's. Values are JSON, at most 64 KiB; a value that isn't JSON (a `Date`, a `Map`) is stored as `JSON.stringify` makes it.
+- A CouchDB failure other than a conflict (credentials, the database unreachable) throws; it is never reported as a conflict. There is no delete.
+
+[`examples/new-item.mjs`](examples/new-item.mjs) uses all of this: it creates numbered notes (`<folder>/<prefix>-NNN.md`) whose numbers stay unique across instances and are never handed out twice. It reserves each number in a `ctx.store` counter by compare-and-swap before creating the note create-only, so a refused create or a crash leaves a gap, never a reused number; it is a `writes: true` tool, so retries with an `op_id` are safe; and it dates notes in `NEW_ITEM_TIMEZONE`, else `DISPLAY_TIMEZONE`, else UTC. `npm run test:new-item` runs it on two instances against a throwaway CouchDB.
+
+### Retries without duplicates (`op_id`, opt-in)
+
+With `OPS_DATABASE` set, `write_note`, `edit_note`, `delete_note` and `move_note` take an optional `op_id` (1-128 characters of `A-Z a-z 0-9 . _ : -`, e.g. a UUID per intended change). The first call with an id runs and its answer is stored in that database; a retry with the same id returns the stored answer without writing again, on any server instance that shares the database and after a restart. The same id with other arguments is refused. A call that was claimed but never finished (still running, or the server stopped mid-call) answers that its outcome is unknown and writes nothing: read the note, then retry with a new id. Records count for 7 days and are not deleted automatically.
 
 ### Attachments (opt-in)
 
@@ -297,6 +341,8 @@ Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable fo
 | `DISPLAY_TIMEZONE` | Optional | server's zone | IANA time zone for the human-readable half of the server time in `search_notes` status lines (UTC is always printed beside it), e.g. `Europe/Berlin`. An invalid zone falls back to UTC with a warning at startup |
 | `MCP_REFRESH_DAYS` | Optional | `14` | Days before auth session expires |
 | `READ_ONLY` | Optional | `false` | Set to `true` to disable all write tools (`write_note`, `edit_note`, `delete_note`, `move_note`). Only read tools are exposed via MCP, and the vault backend rejects writes as well. Useful when sharing the server with multiple AI clients and write access should be opt-in. This protects the vault from MCP clients; it is not a database-level guarantee. To make CouchDB itself refuse writes, use CouchDB-side controls, such as a `validate_doc_update` function that rejects the server's CouchDB user. |
+| `PLUGIN_DIR` | Optional | — | Directory of plugins: every `.js`/`.mjs` file in it adds tools at startup. See [Plugins](#plugins-opt-in). Unset: no plugins. |
+| `OPS_DATABASE` | Optional | — | CouchDB mode. Name of a separate CouchDB database for `op_id` records (created at startup if missing, which needs a user allowed to create databases; otherwise create it once as admin and give the server's user access). Never the vault database. Unset: `op_id` is refused and nothing else changes. |
 | `WRITE_FOLDERS` | Optional | — | Comma-separated list of vault-relative folders where agents may write (e.g. `MCP,Inbox`). The whole vault stays readable; paths outside the listed folders are read-only. Add permissions after a colon to limit a folder: `create` (add new files), `update` (change existing files) and `delete` (delete files or move them away), joined with `+`. A folder without permissions gets all three. For example `MCP,Raw:create,Notes:create+update`: anything goes in `MCP`, agents can add to `Raw` but never overwrite, edit, move or delete what is there, and can add and edit in `Notes` but not delete. `move_note` and `move_attachment` need `delete` at the source and `create` at the destination, and never replace an existing note. An attachment is replaced only with `overwrite=true`, which needs both `create` and `update`, so attachments can't be replaced in an `update`-only folder. The most specific folder applies, so `Raw:create,Raw/scratch` makes `Raw/scratch` fully writable; `/` stands for the vault root (`/,Raw:create` makes everything writable except `Raw`). Matching is folder-boundary-aware (`MCP` matches `MCP/note.md` but not `MCP-private/note.md`). Paths are compared the way the vault resolves them: `\` counts as `/`, and a case variant of a folder (`raw/`) gets only what both spellings allow, since LiveSync, macOS and Windows treat them as one folder. The server refuses to start on an unknown permission, a folder listed twice (case variants included) or a folder that can never match. Enforced server-side, unlike `MCP_INSTRUCTIONS`; in local mode, writes, deletes and moves through a symlink (to a file or a folder) are refused while it is set, since the check sees the requested path; reads still follow symlinks. Ignored when `READ_ONLY=true`; unset or empty means the whole vault is writable. |
 | `ATTACHMENTS_ENABLED` | Optional | `false` | Set to `true` to enable the [attachment tools](#attachments-opt-in) and the upload endpoint. Under `READ_ONLY=true` only `get_attachment_metadata` and `list_attachments` are exposed and the endpoint is not mounted. With CouchDB, startup then always reads the change feed from the beginning to learn existing attachments (it already does so whenever notes are indexed, to rebuild the search text) |
 | `ATTACHMENT_MAX_BYTES` | Optional | `20971520` (20 MB) | Largest file accepted by an upload URL. The whole file is held in memory while it is written |

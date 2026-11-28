@@ -6,6 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
+import { fingerprint, OP_ID_PATTERN, type OpStore } from "./op-store.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -71,6 +72,51 @@ export function applyEdit(existing: string, op: "append" | "prepend" | "replace"
     return existing.endsWith("\n") ? existing + newContent : existing + "\n" + newContent;
 }
 
+export type WriteMode = "upsert" | "create" | "update";
+
+/**
+ * The write mode WRITE_FOLDERS allows for a whole-note write at `path`, or the
+ * refusal to show. Whether it creates or updates depends on the note existing,
+ * so the backend decides in the same step as the write.
+ */
+export function chooseWriteMode(path: string, writeFolders: WriteScope): { mode: WriteMode } | { denied: string } {
+    const allow = allowedActions(path, writeFolders);
+    const canCreate = allow.has("create");
+    const canUpdate = allow.has("update");
+    if (!canCreate && !canUpdate) return { denied: checkWrite(path, "create", writeFolders)! };
+    return { mode: canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update" };
+}
+
+/**
+ * Change a note's text with `apply` the way edit_note does: in CouchDB mode
+ * revision-checked and re-applied when another writer got in first, else read
+ * then written back without recreating a note deleted in between. Returns the
+ * new text, or null when the note doesn't exist. The caller checks
+ * WRITE_FOLDERS ("update") first. Shared with plugins.
+ */
+export async function editNoteText(vault: VaultBackend, path: string, apply: (content: string) => string): Promise<string | null> {
+    if (vault.updateNote) {
+        try {
+            return (await vault.updateNote(path, apply, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS })).content;
+        } catch (err) {
+            if (err instanceof NoteNotFoundError) return null;
+            throw err;
+        }
+    }
+    const existing = await vault.readNote(path);
+    if (existing === null) return null;
+    const updated = apply(existing);
+    let ok: boolean;
+    try {
+        ok = await vault.writeNote(path, updated, { mode: "update" });
+    } catch (err) {
+        if (err instanceof NoteNotFoundError) return null;
+        throw err;
+    }
+    if (!ok) throw new Error(`Failed to edit note: ${path}`);
+    return updated;
+}
+
 function describeMismatch(err: RevisionMismatchError): string {
     return `Revision mismatch: ${err.path} is at revision ${err.current}, not ${err.expected}. Nothing was written; read the note again and reapply your change.`;
 }
@@ -84,6 +130,33 @@ const expectedRevisionParam = z
     .regex(/^[1-9]\d*-[0-9a-f]+$/, "expected_revision must be a revision from read_note or get_note_metadata, like 12-3f9c...")
     .optional()
     .describe("Optional, CouchDB mode: the revision from read_note or get_note_metadata. The write only happens if the note is still at that revision; otherwise nothing is written and the current revision is returned.");
+
+export const NO_OP_STORE_MESSAGE = "op_id needs OPS_DATABASE (CouchDB mode): this server keeps no operation records. Nothing was written.";
+
+const opIdParam = z
+    .string()
+    .regex(OP_ID_PATTERN, "op_id: 1-128 characters from A-Z a-z 0-9 . _ : -")
+    .optional()
+    .describe("Optional idempotency key, unique per intended change (e.g. a UUID). A retry with the same op_id returns the first call's answer instead of writing again.");
+
+/**
+ * Run a write tool at most once per op_id: the first call claims the id and
+ * stores its answer; a repeat gets that answer back without running.
+ */
+async function runOnce(opStore: OpStore, tool: string, args: Record<string, unknown>, run: () => Promise<unknown>): Promise<unknown> {
+    const opId = args.op_id as string;
+    const claim = await opStore.claim(opId, fingerprint(tool, args));
+    if (claim.state === "done") return claim.result;
+    if (claim.state === "mismatch") return `op_id ${opId} was already used for a different call (another tool or other arguments). Nothing was written; use a new op_id.`;
+    if (claim.state === "pending") {
+        return `op_id ${opId} was claimed at ${new Date(claim.startedAt).toISOString()} and has not finished: it is still running, or it was interrupted and its outcome is unknown. ` +
+            "Nothing was done by this call. Read the note to see whether the change is there before retrying with a new op_id.";
+    }
+    // If the call throws, the record stays pending: the write may or may not have happened.
+    const result = await run();
+    await opStore.complete(opId, claim.token, typeof result === "string" ? result : JSON.stringify(result));
+    return result;
+}
 
 // Claude Code persists any MCP tool result above ~50 000 characters to a file
 // and hands the model a 2 kB preview instead of the text. A tool can raise its
@@ -104,6 +177,7 @@ export function registerTools(
     readOnly = false,
     writeFolders: WriteScope = null,
     syncBeforeSearch?: SyncBeforeSearch,
+    opStore?: OpStore,
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
@@ -113,6 +187,19 @@ export function registerTools(
     const writeScopeNote = describeWriteScope(writeFolders);
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
+        // A plugin tool marked `writes: true` is treated like a built-in write tool.
+        const pluginWrite = tool.writes === true;
+        delete tool.writes;
+        if (!readOnly && (pluginWrite || (WRITE_TOOLS as readonly string[]).includes(tool.name))) {
+            tool.parameters = tool.parameters.extend({ op_id: opIdParam });
+            const write = tool.execute;
+            tool.execute = async (args: any, ctx: any) => {
+                if (args.op_id === undefined) return write(args, ctx);
+                if (!opStore) return NO_OP_STORE_MESSAGE;
+                const { op_id: _opId, ...rest } = args;
+                return runOnce(opStore, tool.name, args, () => write(rest, ctx));
+            };
+        }
         const original = tool.execute;
         tool.execute = async (args: any, ctx: any) => {
             if (debugLogging) console.log(`[tool] ${tool.name}(${JSON.stringify(args)})`);
@@ -152,8 +239,13 @@ export function registerTools(
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
             content: z.string().describe("Full markdown content for the note"),
             expected_revision: expectedRevisionParam,
+            create_only: z
+                .boolean()
+                .optional()
+                .describe("Only create: if a note already exists at the path, write nothing and say so. Default false (create or replace)."),
         }),
-        execute: async ({ path, content, expected_revision }) => {
+        execute: async ({ path, content, expected_revision, create_only }) => {
+            if (expected_revision !== undefined && create_only) return "expected_revision names an existing note, so it can't be combined with create_only. Nothing was written.";
             if (expected_revision !== undefined) {
                 // A revision names an existing note, so this is an update.
                 const denied = checkWrite(path, "update", writeFolders);
@@ -174,7 +266,8 @@ export function registerTools(
             // step as the write.
             const allow = allowedActions(path, writeFolders);
             const canCreate = allow.has("create");
-            const canUpdate = allow.has("update");
+            const canUpdate = allow.has("update") && !create_only;
+            if (create_only && !canCreate) return checkWrite(path, "create", writeFolders)!;
             if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders)!;
             const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
             let ok: boolean;
@@ -184,6 +277,7 @@ export function registerTools(
                 ok = await vault.writeNote(path, content, { mode, maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
             } catch (err) {
                 if (err instanceof NoteExistsError) {
+                    if (create_only) return `Note already exists: ${path}. Nothing was written (create_only); choose a new path.`;
                     return `${checkWrite(path, "update", writeFolders)} The note already exists; choose a new path.`;
                 }
                 if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders)!;
