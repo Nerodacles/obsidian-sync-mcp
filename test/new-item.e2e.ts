@@ -26,8 +26,8 @@ const COUCH = (process.env.TEST_COUCHDB_URL ?? "http://localhost:5992").replace(
 const COUCH_USER = process.env.TEST_COUCHDB_USER ?? "admin";
 const COUCH_PASSWORD = process.env.TEST_COUCHDB_PASSWORD ?? "test";
 const PLUGIN = resolve(process.env.NEW_ITEM_PLUGIN ?? "examples/new-item.mjs");
-const DB = "newitemvault";
-const OPS_DB = "newitemops";
+const DB = process.env.TEST_COUCHDB_DATABASE ?? "newitemvault";
+const OPS_DB = process.env.TEST_COUCHDB_OPS_DATABASE ?? "newitemops";
 const AUTH = "new-item-test-token";
 const CALLS = 20;
 const couchAuth = { Authorization: "Basic " + Buffer.from(`${COUCH_USER}:${COUCH_PASSWORD}`).toString("base64") };
@@ -147,7 +147,7 @@ const b = await startServer(9902, scoped, true);
 // An unrestricted instance without the plugin, for setup and inspection only.
 const c = await startServer(9903, {}, false);
 try {
-    check("plugin-loaded", /Plugins from .*new-item\.mjs; ctx\.store in newitemops/.test(a.logs) && /new-item\.mjs; ctx\.store/.test(b.logs),
+    check("plugin-loaded", new RegExp(`Plugins from .*new-item\\.mjs; ctx\\.store in ${OPS_DB}`).test(a.logs) && /new-item\.mjs; ctx\.store/.test(b.logs),
         (a.logs.match(/Plugins from .*/)?.[0] ?? "no plugin line").replace(/\/tmp\/\S+/, "<tmp>"));
     const onC = await connect(c.port);
     await onC("write_note", { path: "ToDo/items/README.md", content: "Not an item." });

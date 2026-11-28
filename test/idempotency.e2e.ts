@@ -21,8 +21,8 @@ import { join } from "node:path";
 const COUCH = (process.env.TEST_COUCHDB_URL ?? "http://localhost:5985").replace(/\/+$/, "");
 const COUCH_USER = process.env.TEST_COUCHDB_USER ?? "admin";
 const COUCH_PASSWORD = process.env.TEST_COUCHDB_PASSWORD ?? "test";
-const DB = "idemvault";
-const OPS_DB = "idemops";
+const DB = process.env.TEST_COUCHDB_DATABASE ?? "idemvault";
+const OPS_DB = process.env.TEST_COUCHDB_OPS_DATABASE ?? "idemops";
 const AUTH = "idempotency-test-token";
 const couchAuth = { Authorization: "Basic " + Buffer.from(`${COUCH_USER}:${COUCH_PASSWORD}`).toString("base64") };
 
