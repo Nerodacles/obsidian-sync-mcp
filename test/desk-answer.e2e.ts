@@ -179,6 +179,14 @@ try {
     a = await startServer(9911, true, aData);
     const n3 = await settle(3);
     check("answer-while-down-fires-once", n3 === 3 && events[2]?.body.kind === "answer", `answer changed while A was down: ${n3} events in total; ${a.logs.match(/startup sweep:.*/)?.[0]}`);
+
+    // A session clears the case through the plugin's own instance; the owner ticks go again in Obsidian.
+    const writeA = await connect(a.port);
+    await writeA("write_note", { path: PATH, content: note() });
+    await sleep(1500);
+    await writeB("write_note", { path: PATH, content: note({ go: "true" }) });
+    const n4 = await settle(4);
+    check("own-clear-seen-then-tick-fires", n4 === 4 && events[3]?.body.kind === "go", `cleared through A, go ticked through B: ${n4} events in total; A log: ${a.logs.match(/\[desk-answer-webhook\.mjs\] sent go.*/g)?.at(-1) ?? "no send line"}`);
 } finally {
     await stopServer(a).catch(() => undefined);
     await stopServer(b);

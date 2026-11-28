@@ -118,15 +118,26 @@ describe("desk-answer plugin: when it fires", () => {
         assert.equal(rx.calls.length, 1);
     });
 
-    it("a different answer, or a new ask answered the same way, fires again", async () => {
+    it("a different answer fires again", async () => {
         const { watcher, vault, rx } = setup();
         vault.save(PATH, caseNote({ answer: '"a"' }));
         await watcher.handle(PATH);
         vault.save(PATH, caseNote({ answer: '"b"' }));
         assert.equal(await watcher.handle(PATH), "sent");
-        vault.save(PATH, caseNote({ answer: '"b"', ask: '"Next question?"' }));
-        assert.equal(await watcher.handle(PATH), "sent");
-        assert.equal(rx.calls.length, 3);
+        assert.equal(rx.calls.length, 2);
+    });
+
+    it("changing ask or recommended while an answer is set fires nothing (only go and answer count)", async () => {
+        const { watcher, vault, rx } = setup();
+        vault.save(PATH, caseNote({ go: "true" }));
+        await watcher.handle(PATH);
+        vault.save(PATH, caseNote({ go: "true", ask: '"Next question?"', recommended: '"no"' }));
+        assert.equal(await watcher.handle(PATH), "already");
+        vault.save(PATH, caseNote({ answer: '"b"' }));
+        await watcher.handle(PATH);
+        vault.save(PATH, caseNote({ answer: '"b"', ask: '"Another question?"' }));
+        assert.equal(await watcher.handle(PATH), "already");
+        assert.equal(rx.calls.length, 2);
     });
 
     it("a cleared case is recorded, so the same tick on the same ask fires again after the session cleared it", async () => {

@@ -20,13 +20,16 @@
 // answer was seen. Headers: X-Desk-Timestamp (unix seconds) and
 // X-Desk-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>">.
 //
-// Once per answer: what is recorded per case is a fingerprint of the
-// effective answer (kind plus a hash of ask and answer, or of ask and
-// recommended for go), not the revision. So an edit that changes neither go
-// nor answer fires nothing, the same answer saved again fires nothing, a
-// restart fires nothing already fired, and a new ask answered the same way
-// fires again. When the case returns to go false and an empty answer, that is
-// recorded too, so the next answer fires even if it is the same text.
+// Once per answer: what is recorded per case is a fingerprint of go and
+// answer only (kind plus a hash of the trimmed answer), not the revision and
+// no other property. So an edit that changes neither go nor answer fires
+// nothing (ask, recommended and the body included), the same answer saved
+// again fires nothing, and a restart fires nothing already fired. When the
+// case returns to go false and an empty answer, that is recorded too, so the
+// next answer fires even if it is the same text. Limit: a clear and a new
+// identical answer that both land while this server is down (or within one
+// feed delivery) look like no change, and fire nothing; the session-start desk
+// query still finds that answer.
 //
 // Delivery is at most once: the fingerprint is claimed in ctx.store (a
 // revision-checked write, so two server instances never both send) BEFORE the
@@ -65,12 +68,9 @@ function textValue(value) {
  * case carries none. A typed answer wins over go.
  */
 export function deskAnswer(properties) {
-    const ask = textValue(properties.ask);
     const answer = textValue(properties.answer);
-    if (answer) return { kind: "answer", fingerprint: sha256(`answer\0${ask}\0${answer}`) };
-    if (textValue(properties.go).toLowerCase() === "true") {
-        return { kind: "go", fingerprint: sha256(`go\0${ask}\0${textValue(properties.recommended)}`) };
-    }
+    if (answer) return { kind: "answer", fingerprint: sha256(`answer\0${answer}`) };
+    if (textValue(properties.go).toLowerCase() === "true") return { kind: "go", fingerprint: sha256("go") };
     return null;
 }
 
