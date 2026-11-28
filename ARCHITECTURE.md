@@ -160,7 +160,8 @@ Agent connects → /oauth/authorize → password page → /oauth/approve
 | `query_notes` | index (frontmatter properties, catch-up first) | — |
 | `get_note_metadata` | vault + index (backlinks) | — |
 | `move_note` | vault | vault + index |
-| `delete_note` | — | vault + index |
+| `rename_note` | vault + index (backlinks) | vault + index (the note, then each linking note) |
+| `delete_note` | vault + index (backlinks) | vault + index (each linking note, then the deletion) |
 | `list_conflicts` | vault (CouchDB `_find` on `_conflicts`) | — |
 | `get_conflict` | vault (every live leaf) | — |
 | `resolve_conflict` | vault | vault + index |

@@ -20,6 +20,7 @@ import {
 import { describeExcluded, describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
 import { fingerprint, OP_ID_PATTERN, type OpStore } from "./op-store.js";
 import { appendToSection, EditRefused, setProperties } from "./structured-edits.js";
+import { addAlias, noteName, rewriteLinks, unlinkLinks, type UnlinkResult } from "./rename.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -42,7 +43,7 @@ export function cleanSearchTerms(terms: string[] | undefined): string[] {
         .slice(0, SEARCH_MAX_TERMS);
 }
 
-const WRITE_TOOLS = ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "resolve_conflict"] as const;
+const WRITE_TOOLS = ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "rename_note", "resolve_conflict"] as const;
 
 /**
  * edit_note rounds when another writer changes the note between its read and
@@ -93,6 +94,9 @@ function describeLeaf(leaf: ConflictLeaf): string {
     return `${leaf.revision}, ${when}, ${leaf.size} bytes${notes.length ? `; ${notes.join("; ")}` : ""}`;
 }
 
+
+/** delete_note and rename_note: a linking note's fresh text no longer holds a link to change, so nothing is written. */
+class NoLinkLeft extends Error {}
 
 /** Apply one edit_note operation to a note's text; throws EditRefused when it can't be applied. */
 export function applyEdit(existing: string, op: "append" | "prepend" | "replace", newContent: string, oldText?: string): string {
@@ -758,11 +762,14 @@ export function registerTools(
 
     if (!readOnly) server.addTool({
         name: "delete_note",
-        description: "Delete a note from the Obsidian vault." + writeScopeNote,
+        description:
+            "Delete a note from the Obsidian vault. By default the links to it are removed first: in every note that links to it, each wikilink, embed and markdown link pointing at it becomes plain text (the link's label, or the note's name); links in code, and short links several notes share, are left alone. Nothing but the note is deleted. " +
+            "Not atomic: each unlinked note and the deletion are separate writes, and the answer lists every note it unlinked and every note it could not. unlink=false deletes the note only." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note to delete"),
+            unlink: z.boolean().optional().describe("Turn the links to the note in other notes into plain text before deleting it. Default true."),
         }),
-        execute: async ({ path }) => {
+        execute: async ({ path, unlink }) => {
             const denied = checkWrite(path, "delete", writeFolders);
             if (denied) return denied;
             // The sync layer reports success even when nothing existed at the
@@ -770,9 +777,106 @@ export function registerTools(
             // readNote returns "" for an empty note and null only when absent.
             const existing = await vault.readNote(path);
             if (existing === null) return `Note not found: ${path}`;
+            if (unlink === false) {
+                const ok = await vault.deleteNote(path);
+                if (ok) searchIndex.remove(path);
+                return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
+            }
+
+            // Backlinks are keyed by path and by name; the name with .md also
+            // catches a markdown link written as a bare file name, and each
+            // shorter tail of the path a partial one ([[Projects/Garden plan]]
+            // for Work/Projects/Garden plan.md). unlinkLinks then decides which
+            // of their links really resolve to the note.
+            const notes = searchIndex.listPaths();
+            if (!notes.some((n) => n.toLowerCase() === path.toLowerCase())) notes.push(path);
+            const segments = path.split("/");
+            const keys = [path, noteName(path) + ".md", ...segments.slice(1, -1).map((_, i) => segments.slice(i + 1).join("/"))];
+            const linkers = [...new Set(keys.flatMap((k) => searchIndex.getBacklinks(k)))]
+                .filter((p) => p.toLowerCase() !== path.toLowerCase())
+                .sort();
+            let unlinkedNotes = 0;
+            let unlinkedLinks = 0;
+            let skipped = 0;
+            let unchanged = 0;
+            const details: string[] = [];
+            const unlinkedPaths: string[] = [];
+            for (const linker of linkers) {
+                const ctx = { target: path, notes, source: linker };
+                try {
+                    const text = await vault.readNote(linker);
+                    if (text === null) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker}, the note is gone`);
+                        continue;
+                    }
+                    const first = unlinkLinks(text, ctx);
+                    const leftovers = describeLeftovers(first);
+                    if (first.unlinked === 0) {
+                        unchanged++;
+                        details.push(`- Unchanged: ${linker}, no link in it needs removing${leftovers}`);
+                        continue;
+                    }
+                    const refused = checkWrite(linker, "update", writeFolders);
+                    if (refused) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker} (${plural(first.unlinked, "link")}), no update permission: ${refused}`);
+                        continue;
+                    }
+                    let result = first;
+                    if (vault.updateNote) {
+                        // CouchDB mode: written only at the revision it was read
+                        // at, re-applied to the newer text when another writer
+                        // got in between, so no concurrent edit is overwritten.
+                        try {
+                            await vault.updateNote(linker, (fresh) => {
+                                result = unlinkLinks(fresh, ctx);
+                                if (result.unlinked === 0) throw new NoLinkLeft();
+                                return result.content;
+                            }, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
+                        } catch (err) {
+                            if (err instanceof NoLinkLeft) {
+                                unchanged++;
+                                details.push(`- Unchanged: ${linker}, its links were removed by another writer${describeLeftovers(result)}`);
+                                continue;
+                            }
+                            throw err;
+                        }
+                    } else if (!(await vault.writeNote(linker, first.content, { mode: "update" }))) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker} (${plural(first.unlinked, "link")}), the write failed`);
+                        continue;
+                    }
+                    searchIndex.update(linker, result.content, Date.now());
+                    unlinkedNotes++;
+                    unlinkedLinks += result.unlinked;
+                    unlinkedPaths.push(linker);
+                    details.push(`- Unlinked: ${linker} (${plural(result.unlinked, "link")})${describeLeftovers(result)}`);
+                } catch (err) {
+                    skipped++;
+                    const why = err instanceof NoteNotFoundError
+                        ? "the note is gone"
+                        : err instanceof UpdateRetriesExhaustedError
+                            ? `it kept changing during ${err.attempts} attempts`
+                            : `error: ${(err as Error).message}`;
+                    details.push(`- Not unlinked: ${linker}, ${why}`);
+                }
+            }
+
             const ok = await vault.deleteNote(path);
             if (ok) searchIndex.remove(path);
-            return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
+            const lines = [ok ? `Deleted: ${path}` : `Failed to delete: ${path}`];
+            if (linkers.length > 0) {
+                lines.push(`Links: ${plural(unlinkedLinks, "link")} turned into plain text in ${plural(unlinkedNotes, "note")}; ${skipped} not unlinked; ${unchanged} unchanged.`);
+                if (!ok && unlinkedNotes > 0) {
+                    lines.push(`The note is still there, but the links to it in ${unlinkedPaths.join(", ")} are already plain text.`);
+                }
+            }
+            if (searchIndex.state !== "ready") {
+                lines.push(`The search index is still ${searchIndex.state}, so notes linking to ${path} may be missing from this list.`);
+            }
+            lines.push(...details);
+            return lines.join("\n");
         },
     });
 
@@ -804,6 +908,155 @@ export function registerTools(
             if (content !== null) searchIndex.update(to, content, Date.now());
             const deepLink = makeDeepLink(vaultName, to);
             return `Moved: ${from} → ${to}\n[Open in Obsidian](${deepLink})`;
+        },
+    });
+
+    if (!readOnly) server.addTool({
+        name: "rename_note",
+        description:
+            "Rename or move a note and update the links to it. Moves the note like move_note (never onto an existing note), then rewrites, in every note that links to it, the wikilinks, embeds and markdown links that point at the old path, keeping each link's label, heading, block reference and style; links in code are left alone. " +
+            "By default the old name is also added to the note's frontmatter `aliases`. " +
+            "Not atomic: the rename and each rewritten note are separate writes, and the answer lists every note it rewrote and every note it could not, with counts." + writeScopeNote,
+        parameters: z.object({
+            from: z.string().describe("Current path, e.g. 'Projects/Garden plan.md'"),
+            to: z.string().describe("New path, e.g. 'Projects/Garden/Spring planting.md'"),
+            update_links: z.boolean().optional().describe("Rewrite the links in other notes. Default true."),
+            keep_alias: z.boolean().optional().describe("Add the old name to the moved note's frontmatter aliases. Default true."),
+        }),
+        execute: async ({ from, to, update_links, keep_alias }) => {
+            // The note itself: the same checks as move_note.
+            const denied = checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders);
+            if (denied) return denied;
+            const content = await vault.readNote(from);
+            if (content === null) return `Note not found: ${from}`;
+            // Linkers are taken before the index forgets the old path. Backlinks
+            // are keyed by path and by name; the name with .md also catches a
+            // markdown link written as a bare file name.
+            const notesBefore = searchIndex.listPaths();
+            const linkers = update_links === false
+                ? []
+                : [...new Set([...searchIndex.getBacklinks(from), ...searchIndex.getBacklinks(noteName(from) + ".md")])]
+                    .filter((p) => p.toLowerCase() !== from.toLowerCase())
+                    .sort();
+            let ok: boolean;
+            try {
+                ok = await vault.moveNote(from, to);
+            } catch (err) {
+                if (err instanceof NoteExistsError) return `A note already exists at ${to}. Nothing was renamed or rewritten.`;
+                throw err;
+            }
+            if (!ok) return `Failed to move: ${from} → ${to}. Nothing was rewritten.`;
+            searchIndex.remove(from);
+            const lines = [`Renamed: ${from} → ${to}`];
+
+            // The moved note: its own links to itself, and the alias. Both
+            // count as part of creating it at the destination.
+            let moved = content;
+            let selfLinks = 0;
+            if (update_links !== false) {
+                const self = rewriteLinks(content, { from, to, notesBefore, sourceBefore: from, sourceAfter: to });
+                moved = self.content;
+                selfLinks = self.rewritten;
+            }
+            const oldName = noteName(from);
+            let aliasLine: string | null = null;
+            if (keep_alias !== false && oldName.toLowerCase() !== noteName(to).toLowerCase()) {
+                const alias = addAlias(moved, oldName);
+                if (alias.status === "added") {
+                    moved = alias.content;
+                    aliasLine = `Alias added to ${to}: ${oldName}`;
+                } else if (alias.status === "present") {
+                    aliasLine = `Alias already present in ${to}: ${oldName}`;
+                } else {
+                    aliasLine = `Alias not added to ${to}: its frontmatter isn't valid YAML (${alias.reason})`;
+                }
+            }
+            if (moved !== content && !(await vault.writeNote(to, moved, { mode: "update" }).catch(() => false))) {
+                aliasLine = `Not updated: ${to} (alias and links to itself), the write failed`;
+                selfLinks = 0;
+                moved = content;
+            }
+            // Indexed once: a second update in the same millisecond would be ignored.
+            searchIndex.update(to, moved, Date.now());
+            if (aliasLine) lines.push(aliasLine);
+            if (selfLinks > 0) lines.push(`Rewritten: ${to} (${plural(selfLinks, "link")} to itself)`);
+
+            let rewrittenNotes = 0;
+            let rewrittenLinks = 0;
+            let skipped = 0;
+            let unchanged = 0;
+            const details: string[] = [];
+            for (const path of linkers) {
+                try {
+                    const text = await vault.readNote(path);
+                    if (text === null) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path}, the note is gone`);
+                        continue;
+                    }
+                    const ctx = { from, to, notesBefore, sourceBefore: path, sourceAfter: path };
+                    const first = rewriteLinks(text, ctx);
+                    const ambiguousOf = (r: { ambiguous: number }) => r.ambiguous > 0 ? `; ${plural(r.ambiguous, "link")} left as written, since several notes share that name` : "";
+                    if (first.rewritten === 0) {
+                        unchanged++;
+                        details.push(`- Unchanged: ${path}, no link in it needs rewriting${ambiguousOf(first)}`);
+                        continue;
+                    }
+                    const refused = checkWrite(path, "update", writeFolders);
+                    if (refused) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path} (${plural(first.rewritten, "link")}), no update permission: ${refused}`);
+                        continue;
+                    }
+                    let result = first;
+                    if (vault.updateNote) {
+                        // CouchDB mode: written only at the revision it was read
+                        // at, re-applied to the newer text when another writer
+                        // got in between, so no concurrent edit is overwritten.
+                        try {
+                            await vault.updateNote(path, (fresh) => {
+                                result = rewriteLinks(fresh, ctx);
+                                if (result.rewritten === 0) throw new NoLinkLeft();
+                                return result.content;
+                            }, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
+                        } catch (err) {
+                            if (err instanceof NoLinkLeft) {
+                                unchanged++;
+                                details.push(`- Unchanged: ${path}, its links were changed by another writer${ambiguousOf(result)}`);
+                                continue;
+                            }
+                            throw err;
+                        }
+                    } else if (!(await vault.writeNote(path, first.content, { mode: "update" }))) {
+                        skipped++;
+                        details.push(`- Not rewritten: ${path} (${plural(first.rewritten, "link")}), the write failed`);
+                        continue;
+                    }
+                    searchIndex.update(path, result.content, Date.now());
+                    rewrittenNotes++;
+                    rewrittenLinks += result.rewritten;
+                    details.push(`- Rewritten: ${path} (${plural(result.rewritten, "link")})${ambiguousOf(result)}`);
+                } catch (err) {
+                    skipped++;
+                    const why = err instanceof NoteNotFoundError
+                        ? "the note is gone"
+                        : err instanceof UpdateRetriesExhaustedError
+                            ? `it kept changing during ${err.attempts} attempts`
+                            : `error: ${(err as Error).message}`;
+                    details.push(`- Not rewritten: ${path}, ${why}`);
+                }
+            }
+            if (update_links === false) {
+                lines.push("Links: not updated (update_links=false).");
+            } else {
+                lines.push(`Links: ${plural(rewrittenLinks, "link")} rewritten in ${plural(rewrittenNotes, "note")}; ${skipped} not rewritten; ${unchanged} unchanged.`);
+                if (searchIndex.state !== "ready") {
+                    lines.push(`The search index is still ${searchIndex.state}, so notes linking to ${from} may be missing from this list.`);
+                }
+            }
+            lines.push(...details);
+            lines.push(`[Open in Obsidian](${makeDeepLink(vaultName, to)})`);
+            return lines.join("\n");
         },
     });
 
@@ -969,4 +1222,16 @@ export function registerTools(
             return lines.join("\n");
         },
     });
+}
+
+/** What unlinkLinks left as written, for a delete_note answer line. */
+function describeLeftovers(result: UnlinkResult): string {
+    const parts: string[] = [];
+    if (result.ambiguous > 0) parts.push(`${plural(result.ambiguous, "link")} left as written, since several notes share that name`);
+    if (result.frontmatterKept > 0) parts.push(`${plural(result.frontmatterKept, "link")} in the frontmatter left as written, since removing them would break its YAML`);
+    return parts.length > 0 ? "; " + parts.join("; ") : "";
+}
+
+function plural(n: number, word: string): string {
+    return `${n} ${word}${n === 1 ? "" : "s"}`;
 }

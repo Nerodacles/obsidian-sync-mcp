@@ -210,7 +210,8 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
         assert.match(await call("write_note", { path: "any/a.md", content: "v2" }), /^Note saved/);
         assert.match(await call("edit_note", { path: "any/a.md", content: "v3" }), /^Note edited \(append\)/);
         assert.match(await call("move_note", { from: "any/a.md", to: "other/a.md" }), /^Moved: any\/a.md → other\/a.md/);
-        assert.match(await call("delete_note", { path: "other/a.md" }), /^Deleted: other\/a.md$/);
+        // The index here is still "building", so the answer adds a warning line.
+        assert.match(await call("delete_note", { path: "other/a.md" }), /^Deleted: other\/a.md$/m);
         assert.equal(await vault.readNote("other/a.md"), null);
         for (const t of tools) assert.doesNotMatch(String(t.description), /Writes are only allowed/, t.name);
     });
@@ -223,7 +224,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
     it("READ_ONLY wins over WRITE_FOLDERS: no write tools at all", async () => {
         const { tools } = await setup("MCP", true);
         const names = tools.map((t) => t.name);
-        for (const w of ["write_note", "edit_note", "delete_note", "move_note"]) assert.ok(!names.includes(w), w);
+        for (const w of ["write_note", "edit_note", "delete_note", "move_note", "rename_note"]) assert.ok(!names.includes(w), w);
     });
 
     it("create-only: refusals read the same whether or not the note exists", async () => {
@@ -233,6 +234,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
             ["edit_note", (p) => ({ path: p, content: "y" })],
             ["delete_note", (p) => ({ path: p })],
             ["move_note", (p) => ({ from: p, to: "MCP/moved.md" })],
+            ["rename_note", (p) => ({ from: p, to: "MCP/moved.md" })],
         ];
         for (const [tool, args] of pairs) {
             const a = await call(tool, args("Raw/exists.md"));
@@ -298,7 +300,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
         assert.match(await call("move_note", { from: "MCP/m.md", to: "Trash/m.md" }), /can't be created/);
         assert.match(await call("move_note", { from: "Trash/a.md", to: "Trash/c.md" }), /'Trash\/c.md' can't be created/, "a rename within needs create");
         assert.match(await call("move_note", { from: "Trash/a.md", to: "MCP/a.md" }), /^Moved: Trash\/a.md → MCP\/a.md/);
-        assert.equal(await call("delete_note", { path: "Trash/b.md" }), "Deleted: Trash/b.md");
+        assert.equal((await call("delete_note", { path: "Trash/b.md" })).split("\n")[0], "Deleted: Trash/b.md");
         assert.equal(await call("delete_note", { path: "Trash/b.md" }), "Note not found: Trash/b.md");
         assert.equal(await vault.readNote("MCP/a.md"), "a");
     });
@@ -646,7 +648,7 @@ describe("op_id (idempotent writes)", () => {
         try {
             for (const t of tools) {
                 const has = "op_id" in t.parameters.shape;
-                assert.equal(has, ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "resolve_conflict"].includes(t.name), t.name);
+                assert.equal(has, ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note", "rename_note", "resolve_conflict"].includes(t.name), t.name);
             }
             const edit = tools.find((t) => t.name === "edit_note");
             assert.equal(edit.parameters.safeParse({ path: "a.md", content: "x", op_id: "has space" }).success, false);
