@@ -15,7 +15,9 @@ import { SearchIndex } from "./search.js";
 import { parseWriteFolders } from "./write-scope.js";
 import { registerTools } from "./tools.js";
 import { registerAttachmentTools } from "./attachment-tools.js";
-import { guardedVault, PluginWriteError } from "./plugins.js";
+import { guardedVault, PluginWriteError, loadPlugins, trackToolNames } from "./plugins.js";
+import { MemoryDocStore } from "./plugin-store.js";
+import { copyFile } from "fs/promises";
 import { UploadRegistry } from "./uploads.js";
 import { memoryAttachments } from "./attachment-test-fixtures.js";
 import { SUPPORTED_ATTACHMENT_EXTENSIONS } from "./attachment-path.js";
@@ -164,7 +166,7 @@ describe("READ_FOLDERS on every read path", () => {
      * then every note fed to the index from the UNWRAPPED backend, so the
      * index's own gate is what keeps hidden notes out.
      */
-    async function setup(readFolders: string | null, writeFolders: string | null = null) {
+    async function setup(readFolders: string | null, writeFolders: string | null = null, { feed = true } = {}) {
         const root = await mkdtemp(join(dir, "v-"));
         const local = new LocalVault(root);
         for (const [path, content] of Object.entries(NOTES)) await local.writeNote(path, content);
@@ -173,7 +175,7 @@ describe("READ_FOLDERS on every read path", () => {
         const searchIndex = new SearchIndex();
         if (scope) searchIndex.restrictTo((p) => isReadable(p, scope));
         let t = 1000;
-        for (const [path, content] of Object.entries(NOTES)) searchIndex.update(path, content, t++);
+        if (feed) for (const [path, content] of Object.entries(NOTES)) searchIndex.update(path, content, t++);
         searchIndex.state = "ready";
         const tools: any[] = [];
         registerTools({ addTool: (tool: any) => tools.push(tool) } as any, vault, searchIndex, "vault", false,
@@ -216,13 +218,17 @@ describe("READ_FOLDERS on every read path", () => {
         assert.match(await control.call("list_notes", {}), /Private\/plan\.md/);
     });
 
-    it("list_notes: the vault fallback before the index is ready is filtered too", async () => {
-        const scoped = await setup(SCOPE);
-        scoped.searchIndex.state = "building";
-        assert.doesNotMatch(await scoped.call("list_notes", {}), /Private|welcome/);
-        const control = await setup(null);
-        control.searchIndex.state = "building";
+    it("list_notes and list_folders: the vault fallback (an empty index) is filtered too", async () => {
+        const scoped = await setup(SCOPE, null, { feed: false });
+        const notes = await scoped.call("list_notes", {});
+        assert.match(notes, /Shared\/a\.md/, "answered by the vault, not the empty index");
+        assert.doesNotMatch(notes, /Private|welcome/);
+        const folders = await scoped.call("list_folders", {});
+        assert.match(folders, /Shared/);
+        assert.doesNotMatch(folders, /Private|root/);
+        const control = await setup(null, null, { feed: false });
         assert.match(await control.call("list_notes", {}), /Private\/plan\.md/);
+        assert.match(await control.call("list_folders", {}), /Private/);
     });
 
     it("list_folders: no hidden folder", async () => {
@@ -538,6 +544,45 @@ describe("READ_FOLDERS for plugins and attachments", () => {
 
         const control = guardedVault(local, new SearchIndex(), null, false);
         assert.match((await control.readNote("Private/plan.md"))!, /codeword/);
+    });
+
+    it("the example new_item plugin: a hidden item folder refuses the create with the read-scope answer", async () => {
+        const run = async (readFolders: string | null) => {
+            const local = new LocalVault(await mkdtemp(join(dir, "v-")));
+            await local.writeNote("Shared/a.md", SHARED_A);
+            const pluginDir = await mkdtemp(join(dir, "p-"));
+            await copyFile(new URL("../examples/new-item.mjs", import.meta.url), join(pluginDir, "new-item.mjs"));
+            const scope = readFolders === null ? null : parseReadFolders(readFolders);
+            const vault = scope ? readScopedVault(local, scope) : local;
+            const index = new SearchIndex();
+            if (scope) index.restrictTo((p) => isReadable(p, scope));
+            const tools: any[] = [];
+            const server = { addTool: (t: any) => { tools.push(t); } };
+            const toolNames = trackToolNames(server);
+            registerTools(server as any, vault, index, "V", false, null, undefined, undefined, [], scope);
+            const docs = new MemoryDocStore();
+            const log = console.log;
+            console.log = () => {};
+            try {
+                await loadPlugins(pluginDir, { server, toolNames, vault, searchIndex: index, vaultName: "V", readOnly: false, writeFolders: null, readFolders: scope, store: docs });
+            } finally {
+                console.log = log;
+            }
+            const tool = tools.find((t) => t.name === "new_item");
+            const answer: string = await tool.execute(tool.parameters.parse({ title: "x" }), {});
+            const all = await local.listNotes();
+            return { answer, created: all.filter((p) => p !== "Shared/a.md"), counter: docs.docs.get("plugin:new-item.mjs:counter")?.value };
+        };
+        const scoped = await run(SCOPE);
+        assert.match(scoped.answer, /^Write access denied: '[^']+' is outside the folders this server can read \(Shared\)\./);
+        assert.deepEqual(scoped.created, []);
+        // Measured, not a design choice of this change: the plugin reserves its number before
+        // the create, so each refused call on a scoped server still uses one number.
+        assert.match(scoped.answer, /was reserved and stays unused\.$/);
+        assert.equal(scoped.counter, 1);
+        const control = await run(null);
+        assert.match(control.answer, /^Created /);
+        assert.equal(control.created.length, 1);
     });
 
     it("get_attachment_metadata on a hidden attachment answers like a missing one; uploads there are refused", async () => {

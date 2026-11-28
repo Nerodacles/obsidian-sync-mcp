@@ -25,6 +25,9 @@
  *             feed and pre-search catch-up) stays hidden; a shared one shows.
  *   writes    every write to a private path is refused, existing or not, and
  *             CouchDB still holds the private note unchanged.
+ *   rescope   the reader restarted on the same data directory with a disjoint
+ *             scope (READ_FOLDERS=Private) finds the private note by search:
+ *             the saved sequence must not skip folders the old scope hid.
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -295,6 +298,15 @@ try {
     check("writes", same === writes.length, odd.length ? odd.join("; ") : `${same} write tools refuse both paths with the same answer`);
     check("writes untouched", (await own.tool("read_note", { path: "Private/plan.md" })) === before && /^Note not found/.test(await own.tool("read_note", { path: "Private/nothing.md" })),
         "the owner reads the private note unchanged and no new note");
+
+    // --- rescope: the same data directory under a disjoint scope ---
+    await stop(reader);
+    const rescoped = await start(READER_PORT, readerDir, { READ_FOLDERS: "Private" });
+    servers.push(rescoped);
+    await waitFor("the rescoped reader's index", async () => /^Index caught up/.test(await rescoped.client.tool("search_notes", { terms: ["codeword"] })));
+    const again = await rescoped.client.tool("search_notes", { terms: ["codeword"] });
+    check("rescope", /Private\/plan\.md/.test(hitLines(again)) && !/Shared/.test(hitLines(again)),
+        JSON.stringify(again.split("\n").filter((l) => !l.startsWith("  "))));
 } finally {
     for (const s of servers) await stop(s).catch(() => undefined);
     await rm(ownerDir, { recursive: true, force: true });

@@ -210,7 +210,12 @@ if (debugLogging) {
 // while the server was down, so nothing kept from disk goes stale. (Clearing
 // here instead would discard the metadata and leave list_notes empty on a
 // path-obfuscated vault until the full rebuild finishes.)
-if (searchIndex.size > 0 && searchIndex.contentCount < searchIndex.size) {
+// With READ_FOLDERS the load may have dropped notes, or all of them, and a
+// changed scope may show folders the saved sequence already went past: always
+// re-read from the start, so every visible note is indexed whatever ran before.
+if (READ_FOLDERS) {
+    searchIndex.since = "0";
+} else if (searchIndex.size > 0 && searchIndex.contentCount < searchIndex.size) {
     console.log(`Persisted metadata for ${searchIndex.size} notes has no text; re-reading note bodies from the start so search_notes covers every note (metadata stays serveable meanwhile).`);
     searchIndex.since = "0";
 }
