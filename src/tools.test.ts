@@ -733,3 +733,59 @@ test("search_notes refuses more than SEARCH_MAX_WORDS distinct words instead of 
     const out = await tool.execute(tool.parameters.parse({ terms }), {});
     assert.match(out, /^Too many words: \d+ distinct words across all terms, at most \d+\./);
 });
+describe("read_note on a missing path", () => {
+    async function setup() {
+        const root = await mkdtemp(join(tmpdir(), "tools-read-"));
+        const vault = new LocalVault(root);
+        const searchIndex = new SearchIndex();
+        const notes: Record<string, string> = {
+            "Projects/Garden plan.md": "---\naliases: [Veg patch, Allotment]\n---\nBeds.",
+            "Archive/Garden plan.md": "Last year.",
+            "Projects/Shed.md": "Tools.",
+        };
+        for (const [p, text] of Object.entries(notes)) {
+            await vault.writeNote(p, text);
+            searchIndex.update(p, text, 1);
+        }
+        const tools: any[] = [];
+        registerTools({ addTool: (t: any) => tools.push(t) } as any, vault, searchIndex, "vault", true);
+        const read = (path: string): Promise<string> => {
+            const tool = tools.find((t) => t.name === "read_note");
+            return tool.execute(tool.parameters.parse({ path }), {});
+        };
+        return { read, root };
+    }
+
+    it("suggests the note whose alias matches the requested name", async () => {
+        const { read, root } = await setup();
+        try {
+            assert.equal(await read("Veg patch.md"), 'Note not found: Veg patch.md\nDid you mean:\n- Projects/Garden plan.md (alias "Veg patch")');
+            assert.equal(await read("Inbox/VEG-patch.md"), 'Note not found: Inbox/VEG-patch.md\nDid you mean:\n- Projects/Garden plan.md (alias "Veg patch")', "case and hyphen");
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it("suggests notes with the same file name in other folders", async () => {
+        const { read, root } = await setup();
+        try {
+            assert.equal(
+                await read("Garden/garden plan.md"),
+                "Note not found: Garden/garden plan.md\nDid you mean:\n- Archive/Garden plan.md (same file name)\n- Projects/Garden plan.md (same file name)",
+            );
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it("still says only that it was not found when nothing matches", async () => {
+        const { read, root } = await setup();
+        try {
+            assert.equal(await read("Projects/Greenhouse.md"), "Note not found: Projects/Greenhouse.md");
+            assert.match(await read("Projects/Shed.md"), /Tools\./, "an existing note is read as before");
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+});
+

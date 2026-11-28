@@ -201,7 +201,7 @@ Set `BASE_URL` to the tunnel URL when using authentication.
 
 | Tool | Description |
 |---|---|
-| `read_note` | Read a note's markdown content by path (CouchDB mode: with its revision) |
+| `read_note` | Read a note's markdown content by path (CouchDB mode: with its revision). For a path that doesn't exist, the answer still says "Note not found" and lists up to five notes whose file name or frontmatter `aliases` match the requested file name (case-insensitive; hyphens, underscores and spaces count as the same) |
 | `write_note` | Create or overwrite a note (replaces entire content); optional `expected_revision`; `create_only: true` refuses to replace an existing note |
 | `edit_note` | Edit a note without rewriting it — append, prepend (after frontmatter), or replace exact text; optional `expected_revision` |
 | `set_properties` | Set or remove frontmatter properties (text, number, true/false, or a list of those); every other byte of the note stays as it was; optional `expected_revision` |
