@@ -7,6 +7,7 @@ import { allowedActions, checkWrite, describeFolders, describeWriteScope, type W
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
 import { fingerprint, OP_ID_PATTERN, type OpStore } from "./op-store.js";
+import { appendToSection, EditRefused, setProperties } from "./structured-edits.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -27,7 +28,7 @@ export function cleanSearchTerms(terms: string[] | undefined): string[] {
         .slice(0, SEARCH_MAX_TERMS);
 }
 
-const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as const;
+const WRITE_TOOLS = ["write_note", "edit_note", "set_properties", "append_to_section", "delete_note", "move_note"] as const;
 
 /**
  * edit_note rounds when another writer changes the note between its read and
@@ -45,9 +46,6 @@ export const EDIT_MIN_RETRY_MS = 3000;
 
 export const NO_REVISIONS_MESSAGE =
     "expected_revision needs CouchDB mode: this vault has no revisions. Nothing was written.";
-
-/** An edit that can't be applied to the note's current text. */
-class EditRefused extends Error {}
 
 /** Apply one edit_note operation to a note's text; throws EditRefused when it can't be applied. */
 export function applyEdit(existing: string, op: "append" | "prepend" | "replace", newContent: string, oldText?: string): string {
@@ -185,6 +183,65 @@ export function registerTools(
         console.log(`WRITE_FOLDERS: writes restricted to ${describeFolders(writeFolders)}.`);
     }
     const writeScopeNote = describeWriteScope(writeFolders);
+
+    /**
+     * Change an existing note with `apply`, which gets its current text and
+     * returns the new one, or throws EditRefused. In CouchDB mode the change is
+     * applied to the text it was read with and written only if the note is
+     * still at that revision; when another writer got in between, it is
+     * re-applied to the new text, so nobody's change is lost. `label` names the
+     * change in the answer: "Note edited (<label>)".
+     */
+    async function editExisting(tool: string, path: string, label: string, apply: (existing: string) => string, expectedRevision?: string): Promise<string> {
+        if (vault.updateNote) {
+            try {
+                const { content: updated, revision, attempts } = await vault.updateNote(path, apply, {
+                    expectedRevision,
+                    maxAttempts: EDIT_MAX_ATTEMPTS,
+                    minRetryMs: EDIT_MIN_RETRY_MS,
+                });
+                if (debugLogging && attempts > 1) console.log(`[tool] ${tool} applied after ${attempts} attempts`);
+                searchIndex.update(path, updated, Date.now());
+                return `Note edited (${label}): ${path}\nRevision: ${revision}\n[Open in Obsidian](${makeDeepLink(vaultName, path)})`;
+            } catch (err) {
+                if (err instanceof EditRefused) return err.message;
+                if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
+                if (err instanceof RevisionMismatchError) return describeMismatch(err);
+                if (err instanceof UpdateRetriesExhaustedError) {
+                    return `Failed to edit note: ${path} kept changing during ${err.attempts} attempts. Nothing was written; try again.`;
+                }
+                throw err;
+            }
+        }
+        if (expectedRevision !== undefined) return NO_REVISIONS_MESSAGE;
+
+        const existing = await vault.readNote(path);
+        if (existing === null) {
+            return `Note not found: ${path}`;
+        }
+        let updated: string;
+        try {
+            updated = apply(existing);
+        } catch (err) {
+            if (err instanceof EditRefused) return err.message;
+            throw err;
+        }
+
+        let ok: boolean;
+        try {
+            // "update": a note deleted since it was read isn't recreated.
+            ok = await vault.writeNote(path, updated, { mode: "update" });
+        } catch (err) {
+            if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
+            throw err;
+        }
+        if (!ok) {
+            return `Failed to edit note: ${path}`;
+        }
+        searchIndex.update(path, updated, Date.now());
+        const deepLink = makeDeepLink(vaultName, path);
+        return `Note edited (${label}): ${path}\n[Open in Obsidian](${deepLink})`;
+    }
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
         // A plugin tool marked `writes: true` is treated like a built-in write tool.
@@ -519,59 +576,46 @@ export function registerTools(
             const denied = checkWrite(path, "update", writeFolders);
             if (denied) return denied;
             const op = operation ?? "append";
+            return await editExisting("edit_note", path, op, (existing) => applyEdit(existing, op, newContent, old_text), expected_revision);
+        },
+    });
 
-            if (vault.updateNote) {
-                // CouchDB mode: the edit is applied to the text it was read with and
-                // written only if the note is still at that revision. When another
-                // writer got in between, the edit is re-applied to the new text
-                // (a replace re-checks old_text each time), so nobody's edit is lost.
-                try {
-                    const { content: updated, revision, attempts } = await vault.updateNote(
-                        path,
-                        (existing) => applyEdit(existing, op, newContent, old_text),
-                        { expectedRevision: expected_revision, maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS },
-                    );
-                    if (debugLogging && attempts > 1) console.log(`[tool] edit_note applied after ${attempts} attempts`);
-                    searchIndex.update(path, updated, Date.now());
-                    return `Note edited (${op}): ${path}\nRevision: ${revision}\n[Open in Obsidian](${makeDeepLink(vaultName, path)})`;
-                } catch (err) {
-                    if (err instanceof EditRefused) return err.message;
-                    if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
-                    if (err instanceof RevisionMismatchError) return describeMismatch(err);
-                    if (err instanceof UpdateRetriesExhaustedError) {
-                        return `Failed to edit note: ${path} kept changing during ${err.attempts} attempts. Nothing was written; try again.`;
-                    }
-                    throw err;
-                }
-            }
-            if (expected_revision !== undefined) return NO_REVISIONS_MESSAGE;
+    // A frontmatter value: text, number, true/false, or a list of those.
+    const propertyScalar = z.union([z.string(), z.number(), z.boolean()]);
 
-            const existing = await vault.readNote(path);
-            if (existing === null) {
-                return `Note not found: ${path}`;
-            }
-            let updated: string;
-            try {
-                updated = applyEdit(existing, op, newContent, old_text);
-            } catch (err) {
-                if (err instanceof EditRefused) return err.message;
-                throw err;
-            }
+    if (!readOnly) server.addTool({
+        name: "set_properties",
+        description:
+            "Set or remove frontmatter properties of a note without rewriting it. Only the keys named change; every other line of the frontmatter (comments, order, quoting) and the body stay exactly as they were. Adds the frontmatter if the note has none. Lists are written as YAML block lists. Refuses a note whose frontmatter isn't valid YAML." + writeScopeNote,
+        parameters: z.object({
+            path: z.string().describe("Vault-relative path to the note, e.g. 'Projects/Garden plan.md'"),
+            set: z
+                .record(z.string(), z.union([propertyScalar, z.array(propertyScalar)]))
+                .describe("Properties to add or change, e.g. {\"state\": \"done\", \"priority\": 2, \"tags\": [\"garden\"]}. Use {} to only remove."),
+            remove: z.array(z.string()).optional().describe("Property names to delete. A name that isn't there is ignored."),
+            expected_revision: expectedRevisionParam,
+        }),
+        execute: async ({ path, set, remove, expected_revision }) => {
+            const denied = checkWrite(path, "update", writeFolders);
+            if (denied) return denied;
+            return await editExisting("set_properties", path, "set_properties", (existing) => setProperties(existing, set, remove), expected_revision);
+        },
+    });
 
-            let ok: boolean;
-            try {
-                // "update": a note deleted since it was read isn't recreated.
-                ok = await vault.writeNote(path, updated, { mode: "update" });
-            } catch (err) {
-                if (err instanceof NoteNotFoundError) return `Note not found: ${path}`;
-                throw err;
-            }
-            if (!ok) {
-                return `Failed to edit note: ${path}`;
-            }
-            searchIndex.update(path, updated, Date.now());
-            const deepLink = makeDeepLink(vaultName, path);
-            return `Note edited (${op}): ${path}\n[Open in Obsidian](${deepLink})`;
+    if (!readOnly) server.addTool({
+        name: "append_to_section",
+        description:
+            "Append one line at the end of a section: under the first heading (any level) with this text, after the section's last line and before the next heading of the same or a higher level. Headings inside code blocks don't count. If the heading is missing, nothing is written unless create_heading is true, which adds '## heading' and the line at the end of the note. Concurrent appends to one section all land." + writeScopeNote,
+        parameters: z.object({
+            path: z.string().describe("Vault-relative path to the note, e.g. 'Projects/Garden plan.md'"),
+            heading: z.string().describe("The heading's text without the #s, e.g. 'Log' for '## Log'. Matched exactly, ignoring surrounding spaces."),
+            line: z.string().describe("The line to add, e.g. '- 2026-04-01 seeds ordered'. One line: a line break inside is refused."),
+            create_heading: z.boolean().optional().describe("Default false. When true and the heading is missing, add '## heading' with the line at the end of the note."),
+        }),
+        execute: async ({ path, heading, line, create_heading }) => {
+            const denied = checkWrite(path, "update", writeFolders);
+            if (denied) return denied;
+            return await editExisting("append_to_section", path, "append_to_section", (existing) => appendToSection(existing, heading, line, create_heading ?? false));
         },
     });
 

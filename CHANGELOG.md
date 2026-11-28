@@ -17,6 +17,7 @@
 ### Tests
 - `npm run test:new-item`: `ctx.store` against a real CouchDB (create-only, stale revision, a revision for a missing key, a failure that is not a conflict), then 20 concurrent calls of the example plugin through two server instances: 20 distinct numbers, every gap accounted for by an answer, 20 notes each holding its own caller's text, the counter at the highest number; a deleted item and a crash after a reservation don't bring a number back; the same `op_id` on both instances creates one note.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
+- **`set_properties` and `append_to_section`.** `set_properties(path, set, remove?, expected_revision?)` changes only the named frontmatter keys (text, number, true/false, or a list of those; lists as block lists) and leaves every other byte of the note as it was, adding the frontmatter if there is none; frontmatter that isn't valid YAML is refused, not rewritten. `append_to_section(path, heading, line, create_heading?)` adds one line at the end of the section under the first heading with that text, before the next heading of the same or a higher level; headings in fenced code don't count, and a missing heading is refused unless `create_heading` is true. Both need `update` permission and use `edit_note`'s revision-checked path, so concurrent appends to one section and changes to different keys all land.
 
 ## 0.14.0
 
