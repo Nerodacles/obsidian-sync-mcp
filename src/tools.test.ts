@@ -885,4 +885,3 @@ describe("query_notes tool", () => {
         assert.equal(lines[1], "Note: Catch-up with the vault failed (timeout); results may be stale. 1 document(s) could not be read and are not counted.");
     });
 });
-
