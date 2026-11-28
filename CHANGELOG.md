@@ -28,6 +28,10 @@
 ### Performance
 - The first start after upgrading parses every note once, to index aliases and the summary and case properties.
 - `read_note` on a path that doesn't exist still answers `Note not found: <path>`, and now adds the notes whose file name or frontmatter `aliases` match the requested name, e.g. `Did you mean:` / `- Projects/Garden plan.md (alias "Veg patch")`.
+- **`query_notes`: filter notes by frontmatter properties with an exact total.** Conditions with `eq`, `ne`, `in`, `contains`, `exists`, `missing`, `lt` and `gt` on any property or on `path`, `folder`, `tags` and `mtime`, combined with AND. Choose the fields shown, sort by one field (missing values last), and page with a cursor. The first line always says how many notes match and which are shown, e.g. `412 notes match; showing 1-50; next cursor: …`, so a cut listing can't pass for a complete one. `format: "json"` returns the same for scripts. Reads only the metadata index, never note bodies.
+
+### Performance
+- The metadata index now also keeps each note's frontmatter properties, so the first start after upgrading parses every note once.
 
 ## 0.14.0
 

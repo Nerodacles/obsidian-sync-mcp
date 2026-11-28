@@ -262,6 +262,32 @@ describe("SearchIndex persistence", () => {
             assert.deepEqual(idx.getTags("n.md"), ["real"]);
         });
 
+        it("keeps the properties query_notes reads across a restart, without parsing again", async () => {
+            const path = join(tmpDir, "properties.json");
+            const note = "---\ntype: recipe\naliases: [Broth, Stock]\n---\nLeeks";
+            const first = new SearchIndex(path);
+            first.update("Recipes/Soup.md", note, 1);
+            await first.saveToDisk();
+            const second = new SearchIndex(path);
+            await second.loadFromDisk();
+            assert.deepEqual(second.queryRecords()[0]?.properties, { type: "recipe", aliases: ["Broth", "Stock"] }, "loaded before any text arrives");
+            second.update("Recipes/Soup.md", note, 1);
+            assert.deepEqual(second.queryRecords()[0]?.properties, { type: "recipe", aliases: ["Broth", "Stock"] });
+            second.remove("Recipes/Soup.md");
+            second.update("Recipes/Soup.md", "no frontmatter now", 2);
+            assert.deepEqual(second.queryRecords()[0]?.properties, {}, "removed with the note");
+        });
+
+        it("parses again a note saved by a parser that kept no properties", async () => {
+            const path = join(tmpDir, "properties-old.json");
+            await writeFile(path, JSON.stringify({ mtimes: { "n.md": 1 }, tags: {}, links: {}, parser: "4:older", hashes: { "n.md": hash }, titles: {} }));
+            const idx = new SearchIndex(path);
+            await idx.loadFromDisk();
+            idx.update("n.md", text, 2);
+            assert.deepEqual(idx.queryRecords()[0]?.properties, { tags: ["real"] });
+            assert.notEqual(PARSER_VERSION.split(":")[0], "4", "PARSER_VERSION was bumped for properties");
+        });
+
         it("saves what it needs to skip parsing after a restart", async () => {
             const path = join(tmpDir, "roundtrip.json");
             const first = new SearchIndex(path);
