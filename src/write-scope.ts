@@ -8,9 +8,11 @@
 //   update  change an existing file (overwrite, edit)
 //   delete  remove a file (incl. a move source)
 //
-// A folder listed without permissions gets all three. Reads are never
-// restricted. When WRITE_FOLDERS is set, paths outside every listed folder are
-// read-only; `/` stands for the vault root. The most specific folder wins.
+// A folder listed without permissions gets all three. When WRITE_FOLDERS is
+// set, paths outside every listed folder are read-only; `/` stands for the
+// vault root. The most specific folder wins. Reads are limited separately, by
+// READ_FOLDERS (read-scope.ts); a path outside the read scope can't be written
+// either, and that refusal comes first.
 
 export type WriteAction = "create" | "update" | "delete";
 export const WRITE_ACTIONS: readonly WriteAction[] = ["create", "update", "delete"];
@@ -88,7 +90,7 @@ function folderShapeProblem(folder: string): string | null {
  * same folders, or "Raw\a.md" would be judged by the root rule while naming the
  * existing Raw/a.md.
  */
-function normalizePath(path: string): string | null {
+export function normalizePath(path: string): string | null {
     const normalized = path.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\//, "");
     // Backends reject traversal too; deny here so the scope check can't be reasoned around.
     const segments = normalized.split("/");
@@ -114,7 +116,7 @@ function mostSpecific(rules: readonly WriteRule[], path: string, key: (s: string
  * (upper-then-lower, so pairs like 'ſ'/'s' meet), and without the trailing dots
  * and spaces Windows strips from each name.
  */
-function fold(s: string): string {
+export function fold(s: string): string {
     return s
         .normalize("NFC")
         .toUpperCase()
@@ -147,8 +149,40 @@ function resolve(path: string, scope: WriteScope): { allow: ReadonlySet<WriteAct
     return { allow, rules: folded.folder.length > exact.folder.length ? [folded, exact] : [exact, folded] };
 }
 
-/** The write actions allowed on `path`. */
-export function allowedActions(path: string, scope: WriteScope): ReadonlySet<WriteAction> {
+/**
+ * Parsed READ_FOLDERS (see read-scope.ts), or null when the whole vault is
+ * readable. Each entry is a normalized vault-relative path: it covers itself
+ * (a note or attachment of that name) and everything under it (a folder).
+ */
+export type ReadScope = readonly string[] | null;
+
+/**
+ * Whether `path` is inside the read scope. Compared exactly (case-sensitive),
+ * after the same normalization the write check uses; traversal is never
+ * readable. A case variant of a listed folder is therefore hidden: the safe
+ * side for a scope that exists to hide things.
+ */
+export function isReadable(path: string, scope: ReadScope): boolean {
+    if (scope === null) return true;
+    const normalized = normalizePath(path);
+    if (normalized === null) return false;
+    const p = normalized.replace(/\/+$/, "");
+    return scope.some((entry) => p === entry || p.startsWith(entry + "/"));
+}
+
+/** e.g. "Shared, Projects/public, welcome.md": the entries as listed. */
+export function describeReadScope(scope: readonly string[]): string {
+    return scope.join(", ");
+}
+
+function readRefusal(path: string, readScope: ReadScope): string | null {
+    if (isReadable(path, readScope)) return null;
+    return `Write access denied: '${path}' is outside the folders this server can read (${describeReadScope(readScope ?? [])}).`;
+}
+
+/** The write actions allowed on `path`; none outside the read scope. */
+export function allowedActions(path: string, scope: WriteScope, readScope: ReadScope = null): ReadonlySet<WriteAction> {
+    if (!isReadable(path, readScope)) return NONE;
     return resolve(path, scope).allow;
 }
 
@@ -192,9 +226,13 @@ const VERB: Record<WriteAction, string> = { create: "created", update: "changed"
 /**
  * Refusal message when `action` on `path` is not allowed, or null when it is.
  * Call this before looking at whether the file exists, so a refusal reads the
- * same either way.
+ * same either way. Outside `readScope` the refusal never depends on
+ * WRITE_FOLDERS or on the path existing, so it can't tell a hidden note from a
+ * missing one.
  */
-export function checkWrite(path: string, action: WriteAction, scope: WriteScope): string | null {
+export function checkWrite(path: string, action: WriteAction, scope: WriteScope, readScope: ReadScope = null): string | null {
+    const hidden = readRefusal(path, readScope);
+    if (hidden) return hidden;
     const { allow, rules } = resolve(path, scope);
     if (allow.has(action)) return null;
     // Name the rule that withholds the action (with case variants, possibly the folded one).

@@ -4,7 +4,7 @@ import { makeDeepLink } from "./deeplink.js";
 import { ConflictChangedError, ConflictLeafUnreadableError, NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type ConflictLeaf, type VaultBackend } from "./vault-backend.js";
 import { diffLines, unifiedDiff } from "./line-diff.js";
 import { termWords, type SearchIndex } from "./search.js";
-import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
+import { allowedActions, checkWrite, describeFolders, describeReadScope, describeWriteScope, type ReadScope, type WriteScope } from "./write-scope.js";
 import { describeIndexState, describeListing, describeNoMatch } from "./list-format.js";
 import {
     QUERY_DEFAULT_LIMIT,
@@ -128,11 +128,11 @@ export type WriteMode = "upsert" | "create" | "update";
  * refusal to show. Whether it creates or updates depends on the note existing,
  * so the backend decides in the same step as the write.
  */
-export function chooseWriteMode(path: string, writeFolders: WriteScope): { mode: WriteMode } | { denied: string } {
-    const allow = allowedActions(path, writeFolders);
+export function chooseWriteMode(path: string, writeFolders: WriteScope, readFolders: ReadScope = null): { mode: WriteMode } | { denied: string } {
+    const allow = allowedActions(path, writeFolders, readFolders);
     const canCreate = allow.has("create");
     const canUpdate = allow.has("update");
-    if (!canCreate && !canUpdate) return { denied: checkWrite(path, "create", writeFolders)! };
+    if (!canCreate && !canUpdate) return { denied: checkWrite(path, "create", writeFolders, readFolders)! };
     return { mode: canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update" };
 }
 
@@ -229,12 +229,19 @@ export function registerTools(
     opStore?: OpStore,
     /** SEARCH_DEFAULT_EXCLUDE, parsed by parseSearchExclude: folders search_notes leaves out unless asked for. */
     searchExclude: string[] = [],
+    /**
+     * READ_FOLDERS, parsed by parseReadFolders. `vault` and `searchIndex` must
+     * already be filtered to it (readScopedVault, SearchIndex.restrictTo); here
+     * it only makes writes outside it refused before anything else is checked.
+     */
+    readFolders: ReadScope = null,
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
     } else if (writeFolders) {
         console.log(`WRITE_FOLDERS: writes restricted to ${describeFolders(writeFolders)}.`);
     }
+    if (readFolders) console.log(`READ_FOLDERS: only ${describeReadScope(readFolders)} can be read or written; everything else reads as missing.`);
     const writeScopeNote = describeWriteScope(writeFolders);
 
     /**
@@ -364,7 +371,7 @@ export function registerTools(
             if (expected_revision !== undefined && create_only) return "expected_revision names an existing note, so it can't be combined with create_only. Nothing was written.";
             if (expected_revision !== undefined) {
                 // A revision names an existing note, so this is an update.
-                const denied = checkWrite(path, "update", writeFolders);
+                const denied = checkWrite(path, "update", writeFolders, readFolders);
                 if (denied) return denied;
                 if (!vault.updateNote) return NO_REVISIONS_MESSAGE;
                 try {
@@ -380,11 +387,11 @@ export function registerTools(
             // Whether this is a create or an update depends on the note existing,
             // so pass what's allowed down and let the backend decide in the same
             // step as the write.
-            const allow = allowedActions(path, writeFolders);
+            const allow = allowedActions(path, writeFolders, readFolders);
             const canCreate = allow.has("create");
             const canUpdate = allow.has("update") && !create_only;
-            if (create_only && !canCreate) return checkWrite(path, "create", writeFolders)!;
-            if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders)!;
+            if (create_only && !canCreate) return checkWrite(path, "create", writeFolders, readFolders)!;
+            if (!canCreate && !canUpdate) return checkWrite(path, "create", writeFolders, readFolders)!;
             const mode = canCreate && canUpdate ? "upsert" : canCreate ? "create" : "update";
             let ok: boolean;
             try {
@@ -394,9 +401,9 @@ export function registerTools(
             } catch (err) {
                 if (err instanceof NoteExistsError) {
                     if (create_only) return `Note already exists: ${path}. Nothing was written (create_only); choose a new path.`;
-                    return `${checkWrite(path, "update", writeFolders)} The note already exists; choose a new path.`;
+                    return `${checkWrite(path, "update", writeFolders, readFolders)} The note already exists; choose a new path.`;
                 }
-                if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders)!;
+                if (err instanceof NoteNotFoundError) return checkWrite(path, "create", writeFolders, readFolders)!;
                 if (err instanceof UpdateRetriesExhaustedError) {
                     return `Failed to write note: ${path} kept changing during ${err.attempts} attempts. Nothing was written; try again.`;
                 }
@@ -714,7 +721,7 @@ export function registerTools(
             expected_revision: expectedRevisionParam,
         }),
         execute: async ({ path, content: newContent, operation, old_text, expected_revision }) => {
-            const denied = checkWrite(path, "update", writeFolders);
+            const denied = checkWrite(path, "update", writeFolders, readFolders);
             if (denied) return denied;
             const op = operation ?? "append";
             return await editExisting("edit_note", path, op, (existing) => applyEdit(existing, op, newContent, old_text), expected_revision);
@@ -737,7 +744,7 @@ export function registerTools(
             expected_revision: expectedRevisionParam,
         }),
         execute: async ({ path, set, remove, expected_revision }) => {
-            const denied = checkWrite(path, "update", writeFolders);
+            const denied = checkWrite(path, "update", writeFolders, readFolders);
             if (denied) return denied;
             return await editExisting("set_properties", path, "set_properties", (existing) => setProperties(existing, set, remove), expected_revision);
         },
@@ -754,7 +761,7 @@ export function registerTools(
             create_heading: z.boolean().optional().describe("Default false. When true and the heading is missing, add '## heading' with the line at the end of the note."),
         }),
         execute: async ({ path, heading, line, create_heading }) => {
-            const denied = checkWrite(path, "update", writeFolders);
+            const denied = checkWrite(path, "update", writeFolders, readFolders);
             if (denied) return denied;
             return await editExisting("append_to_section", path, "append_to_section", (existing) => appendToSection(existing, heading, line, create_heading ?? false));
         },
@@ -770,7 +777,7 @@ export function registerTools(
             unlink: z.boolean().optional().describe("Turn the links to the note in other notes into plain text before deleting it. Default true."),
         }),
         execute: async ({ path, unlink }) => {
-            const denied = checkWrite(path, "delete", writeFolders);
+            const denied = checkWrite(path, "delete", writeFolders, readFolders);
             if (denied) return denied;
             // The sync layer reports success even when nothing existed at the
             // path, so "Deleted" would claim a cleanup that never happened.
@@ -817,7 +824,7 @@ export function registerTools(
                         details.push(`- Unchanged: ${linker}, no link in it needs removing${leftovers}`);
                         continue;
                     }
-                    const refused = checkWrite(linker, "update", writeFolders);
+                    const refused = checkWrite(linker, "update", writeFolders, readFolders);
                     if (refused) {
                         skipped++;
                         details.push(`- Not unlinked: ${linker} (${plural(first.unlinked, "link")}), no update permission: ${refused}`);
@@ -890,7 +897,7 @@ export function registerTools(
         }),
         execute: async ({ from, to }) => {
             // A move deletes at the source and creates at the destination.
-            const denied = checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders);
+            const denied = checkWrite(from, "delete", writeFolders, readFolders) ?? checkWrite(to, "create", writeFolders, readFolders);
             if (denied) return denied;
             const content = await vault.readNote(from);
             let ok: boolean;
@@ -925,7 +932,7 @@ export function registerTools(
         }),
         execute: async ({ from, to, update_links, keep_alias }) => {
             // The note itself: the same checks as move_note.
-            const denied = checkWrite(from, "delete", writeFolders) ?? checkWrite(to, "create", writeFolders);
+            const denied = checkWrite(from, "delete", writeFolders, readFolders) ?? checkWrite(to, "create", writeFolders, readFolders);
             if (denied) return denied;
             const content = await vault.readNote(from);
             if (content === null) return `Note not found: ${from}`;
@@ -1002,7 +1009,7 @@ export function registerTools(
                         details.push(`- Unchanged: ${path}, no link in it needs rewriting${ambiguousOf(first)}`);
                         continue;
                     }
-                    const refused = checkWrite(path, "update", writeFolders);
+                    const refused = checkWrite(path, "update", writeFolders, readFolders);
                     if (refused) {
                         skipped++;
                         details.push(`- Not rewritten: ${path} (${plural(first.rewritten, "link")}), no update permission: ${refused}`);
@@ -1191,7 +1198,7 @@ export function registerTools(
             content: z.string().optional().describe("Merged full markdown text to write. Give keep or content, not both."),
         }),
         execute: async ({ path, expected_leaves, keep, content }) => {
-            const denied = checkWrite(path, "update", writeFolders);
+            const denied = checkWrite(path, "update", writeFolders, readFolders);
             if (denied) return denied;
             if (!vault.resolveConflict) return CONFLICTS_NEED_COUCHDB_MESSAGE;
             if ((keep === undefined) === (content === undefined)) return "Give exactly one of keep or content. Nothing was written.";

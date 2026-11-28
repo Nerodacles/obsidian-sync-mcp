@@ -175,10 +175,37 @@ export class SearchIndex {
     private _lastSyncAt: number | null = null;
     private persistPath: string | null;
     private passphrase: string | null;
+    /** READ_FOLDERS: paths this index may hold; null holds everything. */
+    private visible: ((path: string) => boolean) | null = null;
 
     constructor(persistPath?: string, passphrase?: string) {
         this.persistPath = persistPath ?? null;
         this.passphrase = passphrase ?? null;
+    }
+
+    /**
+     * Hold only the paths `visible` accepts (READ_FOLDERS): drop every other
+     * note and attachment now, including metadata loaded from disk, and ignore
+     * them from then on, whichever path adds them (change feed, a tool's own
+     * write, a plugin). Search, listings, tags, backlinks, suggestions and
+     * the counts on status lines then never see a hidden note.
+     */
+    restrictTo(visible: (path: string) => boolean): void {
+        this.visible = visible;
+        const maps: Map<string, unknown>[] = [
+            this.mtimes, this.tags, this.content, this.titles, this.aliases,
+            this.nameProps, this.properties, this.hashes,
+        ];
+        const paths = new Set<string>([...this.knownPaths, ...this.links.keys(), ...maps.flatMap((m) => [...m.keys()])]);
+        for (const path of paths) {
+            if (visible(path)) continue;
+            this.clearBacklinks(path);
+            this.knownPaths.delete(path);
+            for (const m of maps) m.delete(path);
+        }
+        for (const path of this.attachments.keys()) {
+            if (!visible(path)) this.attachments.delete(path);
+        }
     }
 
     /** Load metadata from disk. */
@@ -222,6 +249,7 @@ export class SearchIndex {
                 this.attachments.set(path, { size, mtime });
             }
             if (data.since) this._since = data.since;
+            if (this.visible) this.restrictTo(this.visible);
             console.log(`Search metadata loaded from disk (${this.knownPaths.size} notes, ${this.attachments.size} attachments, since: ${this._since ? "yes" : "none"}).`);
             return this.knownPaths.size > 0;
         } catch {
@@ -272,6 +300,7 @@ export class SearchIndex {
      * and the note isn't parsed again.
      */
     update(path: string, content: string, mtime?: number): void {
+        if (this.visible && !this.visible(path)) return;
         if (mtime !== undefined && this.content.has(path) && mtime <= (this.mtimes.get(path) ?? -Infinity)) return;
         const hash = createHash("sha1").update(content).digest("base64");
         const unchanged = this.knownPaths.has(path) && this.hashes.get(path) === hash;
@@ -547,6 +576,7 @@ export class SearchIndex {
 
     /** Record or update an attachment's size and mtime. */
     updateAttachment(path: string, size: number, mtime: number): void {
+        if (this.visible && !this.visible(path)) return;
         this.attachments.set(path, { size, mtime });
     }
 
@@ -557,7 +587,7 @@ export class SearchIndex {
     /** Replace every attachment entry (local mode's startup scan). */
     replaceAttachments(entries: Iterable<{ path: string; size: number; mtime: number }>): void {
         this.attachments.clear();
-        for (const e of entries) this.attachments.set(e.path, { size: e.size, mtime: e.mtime });
+        for (const e of entries) this.updateAttachment(e.path, e.size, e.mtime);
     }
 
     clearAttachments(): void {

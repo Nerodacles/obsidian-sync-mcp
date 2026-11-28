@@ -11,6 +11,7 @@ import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.
 import { readOnlyVault } from "./vault-readonly.js";
 import { registerTools } from "./tools.js";
 import { parseWriteFolders, writeScopeWarnings, type WriteScope } from "./write-scope.js";
+import { parseReadFolders, readScopeConflicts, readScopedVault, isReadable, type ReadScope } from "./read-scope.js";
 import { parseAttachmentExtensions, isValidAttachmentPath } from "./attachment-path.js";
 import { registerAttachmentTools, ATTACHMENT_WRITE_TOOLS, formatBytes } from "./attachment-tools.js";
 import { UploadRegistry, mountAttachmentUpload } from "./uploads.js";
@@ -64,6 +65,19 @@ try {
     process.exit(1);
 }
 for (const warning of writeScopeWarnings(WRITE_FOLDERS)) console.warn(warning);
+// Hides everything outside the listed paths from every tool (see read-scope.ts).
+let READ_FOLDERS: ReadScope;
+try {
+    READ_FOLDERS = parseReadFolders(process.env.READ_FOLDERS);
+} catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+}
+const readScopeErrors = readScopeConflicts(READ_FOLDERS, WRITE_FOLDERS, SEARCH_DEFAULT_EXCLUDE);
+if (readScopeErrors.length > 0) {
+    for (const message of readScopeErrors) console.error(message);
+    process.exit(1);
+}
 
 // Attachments (images, PDFs, audio, video) are opt-in.
 const ATTACHMENTS_ENABLED = process.env.ATTACHMENTS_ENABLED === "true";
@@ -164,6 +178,8 @@ console.log("Vault ready.");
 // READ_ONLY also hides the write tools (see registerTools); wrapping the backend
 // makes any write that bypasses the tools fail too.
 if (READ_ONLY) vault = readOnlyVault(vault);
+// Before anything else gets `vault`: the index, the watchers, the tools and plugins.
+if (READ_FOLDERS) vault = readScopedVault(vault, READ_FOLDERS);
 
 // --- Per-vault data directory ---
 const baseDataDir = process.env.DATA_DIR ?? join(process.env.HOME ?? process.env.USERPROFILE ?? "/tmp", ".obsidian-mcp");
@@ -173,6 +189,13 @@ const dataDir = join(baseDataDir, vaultId);
 // --- Search index ---
 const indexPath = join(dataDir, "search-index.json");
 const searchIndex = new SearchIndex(indexPath, COUCHDB_PASSPHRASE);
+
+// The persisted file may come from a run with another READ_FOLDERS (or none):
+// restricting before the load drops its hidden entries as they are read.
+if (READ_FOLDERS) {
+    const scope = READ_FOLDERS;
+    searchIndex.restrictTo((path) => isReadable(path, scope));
+}
 
 // Load persisted metadata from disk
 await searchIndex.loadFromDisk();
@@ -514,7 +537,7 @@ if (OPS_DATABASE && !READ_ONLY) {
 }
 
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined, opStore, SEARCH_DEFAULT_EXCLUDE);
+registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined, opStore, SEARCH_DEFAULT_EXCLUDE, READ_FOLDERS);
 
 if (ATTACHMENTS_ENABLED) {
     const uploadRegistry = new UploadRegistry({ ttlMs: ATTACHMENT_UPLOAD_TTL_SECONDS * 1000 });
@@ -524,6 +547,7 @@ if (ATTACHMENTS_ENABLED) {
         vaultName: VAULT_NAME,
         readOnly: READ_ONLY,
         writeFolders: WRITE_FOLDERS,
+        readFolders: READ_FOLDERS,
         allowedExtensions: ATTACHMENT_EXTENSIONS,
         maxBytes: ATTACHMENT_MAX_BYTES,
         base64MaxBytes: ATTACHMENT_INLINE_MAX_BYTES,
@@ -555,7 +579,7 @@ if (PLUGIN_DIR) {
     try {
         // ctx.store shares OPS_DATABASE (and its checks above) with the op_id records.
         const store = opStore ? new CouchDocStore(COUCHDB_URL!, OPS_DATABASE!, COUCHDB_USER, COUCHDB_PASSWORD!) : undefined;
-        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS, store });
+        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS, readFolders: READ_FOLDERS, store });
         console.log(`Plugins from ${PLUGIN_DIR}: ${loaded.length ? loaded.join(", ") : "none found"}${loaded.length ? (store ? "; ctx.store in " + OPS_DATABASE : "; no ctx.store (needs OPS_DATABASE)") : ""}.`);
     } catch (err) {
         console.error(`PLUGIN_DIR: ${(err as Error).message}`);

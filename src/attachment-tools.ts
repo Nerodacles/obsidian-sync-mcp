@@ -12,7 +12,7 @@ import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
 import { AttachmentExistsError, AttachmentMoveIncompleteError, AttachmentTooLargeError, type VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
-import { allowedActions, checkWrite, describeWriteScope, type WriteAction, type WriteScope } from "./write-scope.js";
+import { allowedActions, checkWrite, describeWriteScope, type ReadScope, type WriteAction, type WriteScope } from "./write-scope.js";
 import { validateAttachmentPath, attachmentExtension } from "./attachment-path.js";
 import { UPLOAD_ROUTE_PREFIX, type UploadRegistry } from "./uploads.js";
 
@@ -26,6 +26,8 @@ export interface AttachmentToolOptions {
     vaultName: string;
     readOnly: boolean;
     writeFolders: WriteScope;
+    /** READ_FOLDERS: writes outside it are refused first (reads are filtered by the backend). */
+    readFolders?: ReadScope;
     allowedExtensions: ReadonlySet<string>;
     /** Largest file accepted by the upload URL. */
     maxBytes: number;
@@ -67,7 +69,7 @@ export function decodeBase64Strict(input: string): Uint8Array {
 }
 
 export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOptions) {
-    const { vault, searchIndex, vaultName, readOnly, writeFolders, allowedExtensions, maxBytes, base64MaxBytes, registry } = opts;
+    const { vault, searchIndex, vaultName, readOnly, writeFolders, readFolders = null, allowedExtensions, maxBytes, base64MaxBytes, registry } = opts;
     const baseUrl = opts.baseUrl.replace(/\/+$/, "");
     const extList = [...allowedExtensions].sort().join(", ");
     const writeScopeNote = describeWriteScope(writeFolders);
@@ -84,7 +86,7 @@ export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOpt
     };
     /** Path validation, then each write action needed at `path`. */
     const checkWritable = (path: string, ...actions: WriteAction[]): string | null =>
-        checkPath(path) ?? actions.map((a) => checkWrite(path, a, writeFolders)).find((m) => m !== null) ?? null;
+        checkPath(path) ?? actions.map((a) => checkWrite(path, a, writeFolders, readFolders)).find((m) => m !== null) ?? null;
     /**
      * Writing to a path that may not exist creates it; overwrite=true may also
      * replace a file there, so it needs update too.
@@ -92,7 +94,7 @@ export function registerAttachmentTools(server: FastMCP, opts: AttachmentToolOpt
     const writeActions = (overwrite: boolean | undefined): WriteAction[] => (overwrite ? ["create", "update"] : ["create"]);
     const exists = (path: string) =>
         `Attachment already exists: ${path}. ` +
-        (allowedActions(path, writeFolders).has("update") ? "Pass overwrite=true to replace it, or choose another path." : "Choose another path.");
+        (allowedActions(path, writeFolders, readFolders).has("update") ? "Pass overwrite=true to replace it, or choose another path." : "Choose another path.");
 
     server.addTool({
         name: "get_attachment_metadata",

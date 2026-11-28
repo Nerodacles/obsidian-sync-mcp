@@ -15,9 +15,10 @@
 | `read_note` on a missing path suggests notes by file name or alias | `read-note-alias-suggestion-v014` | not proposed yet |
 | Sync conflicts: `CONFLICT:` line on reads, `list_conflicts`, `get_conflict`, `resolve_conflict` | `conflict-surfacing-v014` | not proposed yet |
 | `query_notes`: filter by frontmatter with an exact total and a keyset cursor | `query-notes-v014` | not proposed yet |
+| `READ_FOLDERS`: a server-wide read scope; everything outside it reads as missing and can't be written | `read-scope-v014` | not proposed yet |
 | `rename_note` (links rewritten at the revision they were read) and `delete_note` turning links to the deleted note into plain text | `rename-checked-v014` (contains `rename-note-v014` and `delete-unlink-v014`) | not proposed yet |
 
-Authentication and write permissions are upstream's: one `MCP_AUTH_TOKEN` and the server-wide `WRITE_FOLDERS`.
+Authentication and write permissions are upstream's: one `MCP_AUTH_TOKEN` and the server-wide `WRITE_FOLDERS`. The read scope (`READ_FOLDERS`) is server-wide too.
 
 ## Kept on branches, not in main
 
@@ -28,4 +29,4 @@ Authentication and write permissions are upstream's: one `MCP_AUTH_TOKEN` and th
 
 ## Harnesses (need a throwaway CouchDB)
 
-`test:concurrency`, `test:idempotency`, `test:new-item`, `test:conflicts`, `test:delete-unlink`, `test:rename-race`, besides upstream's `test:couchdb` and `test:smoke`.
+`test:concurrency`, `test:idempotency`, `test:new-item`, `test:conflicts`, `test:delete-unlink`, `test:rename-race`, `test:read-scope`, besides upstream's `test:couchdb` and `test:smoke`.
