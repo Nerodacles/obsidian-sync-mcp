@@ -2,10 +2,10 @@ import type { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
 import { NoteExistsError, NoteNotFoundError, RevisionMismatchError, UpdateRetriesExhaustedError, type VaultBackend } from "./vault-backend.js";
-import type { SearchIndex } from "./search.js";
+import { termWords, type SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
-import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
+import { describeExcluded, describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
 import { fingerprint, OP_ID_PATTERN, type OpStore } from "./op-store.js";
 import { appendToSection, EditRefused, setProperties } from "./structured-edits.js";
 
@@ -19,6 +19,8 @@ export const SEARCH_MAX_HITS = 20;
 export const SEARCH_MAX_TERMS = 20;
 /** Each term is compiled into a regex; a very long one overflows the stack (~10 KB with flags iu) or blocks the event loop, so its length is capped. */
 export const SEARCH_MAX_TERM_LENGTH = 200;
+/** Each distinct word is one more regex pass over every note, so their number across all terms is capped too. */
+export const SEARCH_MAX_WORDS = 100;
 
 /** Trim, drop empty terms, cut each to SEARCH_MAX_TERM_LENGTH and clamp to SEARCH_MAX_TERMS — a backstop behind the schema's .max(). */
 export function cleanSearchTerms(terms: string[] | undefined): string[] {
@@ -176,6 +178,8 @@ export function registerTools(
     writeFolders: WriteScope = null,
     syncBeforeSearch?: SyncBeforeSearch,
     opStore?: OpStore,
+    /** SEARCH_DEFAULT_EXCLUDE, parsed by parseSearchExclude: folders search_notes leaves out unless asked for. */
+    searchExclude: string[] = [],
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
@@ -445,18 +449,22 @@ export function registerTools(
         name: "search_notes",
         description:
             "Search note contents for terms, case-insensitive.\n" +
-            "Paths and frontmatter titles are searched first and such hits rank on top, marked [path/title]; content hits follow. " +
+            "Paths, frontmatter titles, aliases and the summary and case properties are searched first and such hits rank on top, marked [path/title]; content hits follow. " +
             "Returns paths with one context line each, never the note body: call read_note on a hit before relying on it. " +
-            "Give `terms` (a note matches when ANY term occurs — OR, so list synonyms, field names and other-language wordings; a term may contain spaces; ranked by how many terms match) " +
+            "Give `terms` (a note matches when ANY term matches — OR, so list synonyms, field names and other-language wordings; ranked by how many terms match). " +
+            "A term matches when ALL its words (split at spaces and hyphens) occur as whole words, in any order: 'garden plan' finds 'plan for the garden', 'ups' does not find 'backups', and 'site-loss' equals 'site loss'. " +
             "Filters: folder, tag, modified_after. " +
             "The first line of every response is the index status: the CouchDB sequence the index is caught up with after a catch-up run just before the search, " +
-            "the server time (local zone and UTC), its age in minutes, how many notes carry content, and any documents that could not be read.",
+            "the server time (local zone and UTC), its age in minutes, how many notes carry content, and any documents that could not be read" +
+            (searchExclude.length > 0
+                ? `; folders ${searchExclude.join(", ")} are left out unless \`folder\` points inside one, and the status line says how many matching notes they held.`
+                : "."),
         parameters: z.object({
             terms: z
                 .array(z.string().max(SEARCH_MAX_TERM_LENGTH))
                 .max(SEARCH_MAX_TERMS)
                 .optional()
-                .describe(`Case-insensitive substrings, at most ${SEARCH_MAX_TERMS} of at most ${SEARCH_MAX_TERM_LENGTH} characters each; a note matches when any of them occurs. E.g. ['drag i kanban', 'kanban', 'labels på kategori'].`),
+                .describe(`Case-insensitive words or groups of words, at most ${SEARCH_MAX_TERMS} of at most ${SEARCH_MAX_TERM_LENGTH} characters each; a note matches when any term matches, and a term matches when all its words occur. E.g. ['drag i kanban', 'kanban', 'labels på kategori'].`),
             folder: z
                 .string()
                 .optional()
@@ -479,6 +487,10 @@ export function registerTools(
             if (cleanTerms.length === 0) {
                 return "Give at least one term.";
             }
+            const words = new Set(cleanTerms.flatMap(termWords)).size;
+            if (words > SEARCH_MAX_WORDS) {
+                return `Too many words: ${words} distinct words across all terms, at most ${SEARCH_MAX_WORDS}. Use fewer or shorter terms.`;
+            }
             let modifiedAfter: number | undefined;
             if (modified_after) {
                 modifiedAfter = new Date(modified_after).getTime();
@@ -499,9 +511,10 @@ export function registerTools(
                 unreadable: sync.unreadable,
                 error: sync.error,
             };
-            const { hits, total } = searchIndex.search({ terms: cleanTerms, folder, tag, modifiedAfter, limit: cap });
+            const { hits, total, excluded } = searchIndex.search({ terms: cleanTerms, folder, tag, modifiedAfter, exclude: searchExclude, limit: cap });
             const query = describeQuery(cleanTerms);
-            return `${describeSync(status)}\n${describeHits(hits, total, query, (p) => makeDeepLink(vaultName, p))}`;
+            const excludedNote = describeExcluded(searchExclude, folder, excluded);
+            return `${describeSync(status)}${excludedNote}\n${describeHits(hits, total, query, (p) => makeDeepLink(vaultName, p))}`;
         },
     });
 

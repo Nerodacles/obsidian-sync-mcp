@@ -18,6 +18,15 @@
 - `npm run test:new-item`: `ctx.store` against a real CouchDB (create-only, stale revision, a revision for a missing key, a failure that is not a conflict), then 20 concurrent calls of the example plugin through two server instances: 20 distinct numbers, every gap accounted for by an answer, 20 notes each holding its own caller's text, the counter at the highest number; a deleted item and a crash after a reservation don't bring a number back; the same `op_id` on both instances creates one note.
 - `npm run test:idempotency`: the same `op_id` through two instances, after a restart and at the same moment, against a throwaway CouchDB.
 - **`set_properties` and `append_to_section`.** `set_properties(path, set, remove?, expected_revision?)` changes only the named frontmatter keys (text, number, true/false, or a list of those; lists as block lists) and leaves every other byte of the note as it was, adding the frontmatter if there is none; frontmatter that isn't valid YAML is refused, not rewritten. `append_to_section(path, heading, line, create_heading?)` adds one line at the end of the section under the first heading with that text, before the next heading of the same or a higher level; headings in fenced code don't count, and a missing heading is refused unless `create_heading` is true. Both need `update` permission and use `edit_note`'s revision-checked path, so concurrent appends to one section and changes to different keys all land.
+- **`search_notes` matches words, not substrings.** A term with several words matches a note that contains all of them in any order (`garden plan` finds "the plan for the garden"), words match whole (`ups` no longer finds "backups"), and a hyphen and a space between words are the same (`site-loss` == `site loss`). See [search matching](README.md#search-matching).
+- Frontmatter `aliases` and the `summary` and `case` properties are searched together with the path and title, so their hits rank above plain text hits.
+- `SEARCH_DEFAULT_EXCLUDE` (comma-separated folders) leaves those folders out of `search_notes` unless `folder` points inside one. The status line says which folders were left out and how many matching notes they held. Unset keeps today's behaviour.
+
+### Breaking changes
+- `search_notes` no longer matches part of a word: `backup` does not find "backups", and `drag kanban` finds notes with both words anywhere, not only the phrase. A term made only of hyphens and spaces (`---`) matches nothing. A query with more than 100 distinct words is refused.
+
+### Performance
+- The first start after upgrading parses every note once, to index aliases and the summary and case properties.
 
 ## 0.14.0
 
