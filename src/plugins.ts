@@ -15,6 +15,13 @@
  * vault, its keys namespaced by the plugin's file name (see plugin-store.ts).
  * Without OPS_DATABASE `ctx.store` is absent, so a plugin can check for it.
  *
+ * Changes: in CouchDB mode `ctx.onNoteChange(listener)` is called for every
+ * note change the server applies to its index from the CouchDB changes feed,
+ * including edits made in Obsidian and replicated by LiveSync (see
+ * note-events.ts for what a listener can and cannot rely on). In local mode
+ * `ctx.onNoteChange` is absent. `ctx.parseFrontmatter(content)` reads a
+ * note's properties with the server's own parser.
+ *
  * Writes and op_id: a tool added with `writes: true` is handled like the
  * built-in write tools: with OPS_DATABASE it takes `op_id` through the same
  * wrapper (records in the same database, keyed by tool name and arguments),
@@ -37,6 +44,8 @@ import { checkWrite, type WriteScope } from "./write-scope.js";
 import { chooseWriteMode, editNoteText, NO_REVISIONS_MESSAGE } from "./tools.js";
 import { READ_ONLY_MESSAGE } from "./vault-readonly.js";
 import { scopedStore, type DocStore, type PluginStore } from "./plugin-store.js";
+import type { NoteChangeHub, NoteChangeListener } from "./note-events.js";
+import { parseFrontmatterAndLinks } from "./parse.js";
 
 /** Why a plugin write was refused, for a plugin that reacts to it (e.g. picks another path on "exists"). */
 export type PluginWriteErrorCode = "read_only" | "denied" | "exists" | "not_found" | "revision_mismatch" | "unsupported" | "failed";
@@ -91,6 +100,18 @@ export interface PluginContext {
     /** Present only when OPS_DATABASE is set; see plugin-store.ts. */
     store?: PluginStore;
     addTool(tool: PluginTool): void;
+    /**
+     * CouchDB mode only: call `listener` for each note change from the CouchDB
+     * changes feed (edits in Obsidian included). A trigger, not the truth: see
+     * note-events.ts.
+     */
+    onNoteChange?(listener: NoteChangeListener): void;
+    /**
+     * A note's properties as the server reads them: YAML "failsafe", every
+     * value a string as written (a plain list joined with ", "); `error` when
+     * the frontmatter isn't valid YAML (then `properties` is empty).
+     */
+    parseFrontmatter(content: string): { properties: Record<string, string>; error?: string };
     log(message: string): void;
 }
 
@@ -198,6 +219,8 @@ export interface LoadOptions {
     writeFolders: WriteScope;
     /** OPS_DATABASE's documents; each plugin gets its own namespaced `ctx.store` on it. Absent: no `ctx.store`. */
     store?: DocStore;
+    /** CouchDB mode: the changes the index applies. Absent: no `ctx.onNoteChange`. */
+    noteEvents?: NoteChangeHub;
 }
 
 /** Load every plugin in `dir`. Throws, naming the file, on the first one that fails. Returns the files loaded. */
@@ -234,6 +257,14 @@ export async function loadPlugins(dir: string, options: LoadOptions): Promise<st
             vault,
             ...(options.store ? { store: scopedStore(options.store, file) } : {}),
             log: (message) => console.log(`[${file}] ${message}`),
+            ...(options.noteEvents ? { onNoteChange: (listener: NoteChangeListener) => {
+                if (typeof listener !== "function") throw new Error(`${where}: onNoteChange needs a function.`);
+                options.noteEvents!.subscribe(listener, file);
+            } } : {}),
+            parseFrontmatter: (content: string) => {
+                const { frontmatter, frontmatterError } = parseFrontmatterAndLinks(content);
+                return frontmatterError ? { properties: {}, error: frontmatterError } : { properties: frontmatter };
+            },
             addTool: (tool) => {
                 if (!tool || typeof tool.name !== "string" || !TOOL_NAME.test(tool.name)) {
                     throw new Error(`${where}: tool name must match ${TOOL_NAME}, got ${JSON.stringify(tool?.name)}.`);

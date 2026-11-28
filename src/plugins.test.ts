@@ -138,7 +138,7 @@ describe("plugins", () => {
         const { load, call } = await setup(undefined, { "tasks.mjs": EXAMPLE });
         await load();
         assert.deepEqual(JSON.parse(await call("inspect_context", {})), {
-            ctx: ["addTool", "log", "readOnly", "vault", "vaultName", "z"],
+            ctx: ["addTool", "log", "parseFrontmatter", "readOnly", "vault", "vaultName", "z"],
             // Local mode has no revisions, so no readNoteRevision.
             vault: ["deleteNote", "editNote", "getMetadata", "listNotes", "moveNote", "readNote", "writeNote"],
         });
@@ -162,7 +162,7 @@ export default function register(ctx) {
         const docs = new MemoryDocStore();
         const { load, call } = await setup(undefined, { "one.mjs": counter("one"), "two.mjs": counter("two") }, false, docs);
         await load();
-        assert.deepEqual(JSON.parse(await call("one_keys", {})), { ctx: ["addTool", "log", "readOnly", "store", "vault", "vaultName", "z"], store: ["get", "put"] });
+        assert.deepEqual(JSON.parse(await call("one_keys", {})), { ctx: ["addTool", "log", "parseFrontmatter", "readOnly", "store", "vault", "vaultName", "z"], store: ["get", "put"] });
         assert.equal(await call("one", {}), "1");
         assert.equal(await call("one", {}), "2");
         assert.equal(await call("two", {}), "1");

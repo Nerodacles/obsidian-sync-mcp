@@ -19,6 +19,7 @@ import { parsePathNormalization, type PathNormalizationSetting } from "./path-id
 import { declareUtf8Charset } from "./http-charset.js";
 import { CouchDocStore } from "./plugin-store.js";
 import { loadPlugins, trackToolNames } from "./plugins.js";
+import { NoteChangeHub } from "./note-events.js";
 import { CouchOpStore } from "./op-store.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
@@ -202,6 +203,12 @@ const onAttachmentChange: AttachmentChangeCallback | undefined = ATTACHMENTS_ENA
     }
     : undefined;
 
+// Every change applied to the index from the CouchDB changes feed is also
+// offered to plugins (ctx.onNoteChange). Created before the first catch-up;
+// plugins subscribe when they load, later, and changes applied before that
+// are not replayed (note-events.ts).
+const noteEvents = COUCHDB_URL ? new NoteChangeHub() : undefined;
+
 // Sync metadata in background (server starts immediately)
 async function rebuildIndex() {
     const start = performance.now();
@@ -241,6 +248,7 @@ async function rebuildIndex() {
             if (content !== null) seen.add(path); else seen.delete(path);
             // content === "" is an empty-but-present note: index it, don't drop it.
             applyIndexChange(searchIndex, path, content, mtime);
+            noteEvents?.emit(path, content);
         };
         try {
             const newSince = await vault.catchUp(since, countingCallback, onBatch, undefined, countingAttachment);
@@ -334,7 +342,10 @@ async function syncBeforeSearch(): Promise<{ unreadable: number; error?: string 
         try {
             const newSince = await vault.catchUp!(
                 searchIndex.since || "0",
-                (path, content, mtime) => applyIndexChange(searchIndex, path, content, mtime),
+                (path, content, mtime) => {
+                    applyIndexChange(searchIndex, path, content, mtime);
+                    noteEvents?.emit(path, content);
+                },
                 undefined,
                 stats,
                 onAttachmentChange,
@@ -413,6 +424,7 @@ function startCouchDbWatcher() {
         if (debugLogging) console.log(`[debug] CouchDB ${content === null ? "delete" : "change"}: ${path}`);
         // content === "" is an empty-but-present note: index it, don't drop it.
         applyIndexChange(searchIndex, path, content, mtime);
+        noteEvents?.emit(path, content);
         if (seq) {
             searchIndex.since = String(seq);
             searchIndex.lastSyncAt = Date.now();
@@ -553,7 +565,7 @@ if (PLUGIN_DIR) {
     try {
         // ctx.store shares OPS_DATABASE (and its checks above) with the op_id records.
         const store = opStore ? new CouchDocStore(COUCHDB_URL!, OPS_DATABASE!, COUCHDB_USER, COUCHDB_PASSWORD!) : undefined;
-        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS, store });
+        const loaded = await loadPlugins(PLUGIN_DIR, { server, toolNames, vault, searchIndex, vaultName: VAULT_NAME, readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS, store, noteEvents });
         console.log(`Plugins from ${PLUGIN_DIR}: ${loaded.length ? loaded.join(", ") : "none found"}${loaded.length ? (store ? "; ctx.store in " + OPS_DATABASE : "; no ctx.store (needs OPS_DATABASE)") : ""}.`);
     } catch (err) {
         console.error(`PLUGIN_DIR: ${(err as Error).message}`);
