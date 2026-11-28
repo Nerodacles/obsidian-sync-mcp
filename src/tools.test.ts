@@ -209,7 +209,8 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
         assert.match(await call("write_note", { path: "any/a.md", content: "v2" }), /^Note saved/);
         assert.match(await call("edit_note", { path: "any/a.md", content: "v3" }), /^Note edited \(append\)/);
         assert.match(await call("move_note", { from: "any/a.md", to: "other/a.md" }), /^Moved: any\/a.md → other\/a.md/);
-        assert.match(await call("delete_note", { path: "other/a.md" }), /^Deleted: other\/a.md$/);
+        // The index here is still "building", so the answer adds a warning line.
+        assert.match(await call("delete_note", { path: "other/a.md" }), /^Deleted: other\/a.md$/m);
         assert.equal(await vault.readNote("other/a.md"), null);
         for (const t of tools) assert.doesNotMatch(String(t.description), /Writes are only allowed/, t.name);
     });
@@ -298,7 +299,7 @@ describe("WRITE_FOLDERS: every note tool under every permission set", () => {
         assert.match(await call("move_note", { from: "MCP/m.md", to: "Trash/m.md" }), /can't be created/);
         assert.match(await call("move_note", { from: "Trash/a.md", to: "Trash/c.md" }), /'Trash\/c.md' can't be created/, "a rename within needs create");
         assert.match(await call("move_note", { from: "Trash/a.md", to: "MCP/a.md" }), /^Moved: Trash\/a.md → MCP\/a.md/);
-        assert.equal(await call("delete_note", { path: "Trash/b.md" }), "Deleted: Trash/b.md");
+        assert.equal((await call("delete_note", { path: "Trash/b.md" })).split("\n")[0], "Deleted: Trash/b.md");
         assert.equal(await call("delete_note", { path: "Trash/b.md" }), "Note not found: Trash/b.md");
         assert.equal(await vault.readNote("MCP/a.md"), "a");
     });

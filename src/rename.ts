@@ -200,6 +200,105 @@ export function rewriteLinks(content: string, ctx: RenameContext): RewriteResult
     return { content: out, rewritten, ambiguous };
 }
 
+export interface UnlinkContext {
+    /** The note about to be deleted. */
+    target: string;
+    /** Every note path, the target included. */
+    notes: readonly string[];
+    /** The note whose text is being changed. */
+    source: string;
+}
+
+export interface UnlinkResult {
+    content: string;
+    /** Links turned into plain text. */
+    unlinked: number;
+    /** Links whose target several notes share; left as they were. */
+    ambiguous: number;
+    /** Links in the frontmatter left as written, because removing them would break its YAML. */
+    frontmatterKept: number;
+}
+
+/**
+ * Turn the wikilinks, embeds and markdown links in `content` that resolve to
+ * `ctx.target` into plain text: the link's label when it has one, else the
+ * target's file name without `.md`. A link in a table loses its `\|` escape
+ * with the rest of the link. Everything else stays byte for byte. Links in
+ * code are left alone, and so are links several notes share a name with.
+ * Wikilinks in the frontmatter are unlinked too, unless the YAML would no
+ * longer parse; markdown links there are not links.
+ */
+export function unlinkLinks(content: string, ctx: UnlinkContext): UnlinkResult {
+    const fm = content.match(FRONTMATTER);
+    const bodyStart = fm ? fm[0].length : 0;
+    const code = codeRanges(content, bodyStart);
+    const inCode = (i: number) => code.some(([s, e]) => i >= s && i < e);
+    const name = noteName(ctx.target);
+    let ambiguous = 0;
+
+    const pointsAtTarget = (target: string): boolean => {
+        const resolved = resolveLink(target, ctx.source, ctx.notes);
+        if (resolved === "ambiguous") {
+            if (resolveLink(target, ctx.source, [ctx.target]) === ctx.target) ambiguous++;
+            return false;
+        }
+        return resolved !== null && lower(resolved) === lower(ctx.target);
+    };
+
+    const edits: Array<{ start: number; end: number; text: string }> = [];
+    for (const m of content.matchAll(WIKILINK)) {
+        const [whole, rawTarget, rest] = m;
+        if (inCode(m.index)) continue;
+        // [[note\|label]] in a table: the backslash ends the target.
+        const target = rawTarget.endsWith("\\") && rest.startsWith("|") ? rawTarget.slice(0, -1) : rawTarget;
+        if (!pointsAtTarget(target)) continue;
+        // The label follows the first pipe; a backslash before it is a table escape.
+        const joined = rawTarget + rest;
+        const pipe = joined.indexOf("|");
+        const label = pipe === -1 ? "" : joined.slice(pipe + 1);
+        const embed = m.index > 0 && content[m.index - 1] === "!";
+        const start = embed ? m.index - 1 : m.index;
+        edits.push({ start, end: m.index + whole.length, text: label.trim() !== "" ? label : name });
+    }
+    for (const m of content.matchAll(MDLINK)) {
+        const [whole, head, rawHref] = m;
+        const start = m.index;
+        const end = start + whole.length;
+        if (start < bodyStart || inCode(start) || inCode(start + head.length)) continue;
+        if (edits.some((e) => start < e.end && e.start < end)) continue;
+        const href = rawHref.startsWith("<") ? rawHref.slice(1, -1) : rawHref;
+        const hash = href.indexOf("#");
+        const rawPath = hash === -1 ? href : href.slice(0, hash);
+        if (!rawPath || /^[a-z][a-z0-9+.-]*:/i.test(rawPath)) continue;
+        let path: string;
+        try { path = decodeURIComponent(rawPath); } catch { continue; }
+        if (!lower(path).endsWith(".md")) continue;
+        if (!pointsAtTarget(path)) continue;
+        const text = head.match(/^!?\[([\s\S]*)\]\(\s*$/)?.[1] ?? "";
+        edits.push({ start, end, text: text.trim() !== "" ? text : name });
+    }
+
+    const apply = (list: typeof edits) => {
+        let out = content;
+        for (const e of [...list].sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+        return out;
+    };
+    let kept = 0;
+    let out = apply(edits);
+    if (fm && edits.some((e) => e.start < bodyStart)) {
+        const yamlOf = (text: string) => text.match(FRONTMATTER)?.[1] ?? "";
+        const parses = (yaml: string) => parseDocument(yaml, { uniqueKeys: false }).errors.length === 0;
+        if (parses(yamlOf(content)) && !parses(yamlOf(out))) {
+            const body = edits.filter((e) => e.start >= bodyStart);
+            kept = edits.length - body.length;
+            edits.length = 0;
+            edits.push(...body);
+            out = apply(edits);
+        }
+    }
+    return { content: out, unlinked: edits.length, ambiguous, frontmatterKept: kept };
+}
+
 /** %-encode a path for a markdown link, segment by segment, parentheses too. */
 function encodePath(path: string): string {
     return path.split("/").map((s) => encodeURIComponent(s).replace(/\(/g, "%28").replace(/\)/g, "%29")).join("/");

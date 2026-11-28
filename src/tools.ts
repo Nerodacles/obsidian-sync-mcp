@@ -6,7 +6,7 @@ import type { SearchIndex } from "./search.js";
 import { allowedActions, checkWrite, describeFolders, describeWriteScope, type WriteScope } from "./write-scope.js";
 import { describeListing, describeNoMatch } from "./list-format.js";
 import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
-import { addAlias, noteName, rewriteLinks } from "./rename.js";
+import { addAlias, noteName, rewriteLinks, unlinkLinks, type UnlinkResult } from "./rename.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -49,6 +49,9 @@ export const NO_REVISIONS_MESSAGE =
 
 /** An edit that can't be applied to the note's current text. */
 class EditRefused extends Error {}
+
+/** delete_note: a linking note's fresh text no longer holds a link to remove, so nothing is written. */
+class NothingToUnlink extends Error {}
 
 /** Apply one edit_note operation to a note's text; throws EditRefused when it can't be applied. */
 export function applyEdit(existing: string, op: "append" | "prepend" | "replace", newContent: string, oldText?: string): string {
@@ -485,11 +488,14 @@ export function registerTools(
 
     if (!readOnly) server.addTool({
         name: "delete_note",
-        description: "Delete a note from the Obsidian vault." + writeScopeNote,
+        description:
+            "Delete a note from the Obsidian vault. By default the links to it are removed first: in every note that links to it, each wikilink, embed and markdown link pointing at it becomes plain text (the link's label, or the note's name); links in code, and short links several notes share, are left alone. Nothing but the note is deleted. " +
+            "Not atomic: each unlinked note and the deletion are separate writes, and the answer lists every note it unlinked and every note it could not. unlink=false deletes the note only." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note to delete"),
+            unlink: z.boolean().optional().describe("Turn the links to the note in other notes into plain text before deleting it. Default true."),
         }),
-        execute: async ({ path }) => {
+        execute: async ({ path, unlink }) => {
             const denied = checkWrite(path, "delete", writeFolders);
             if (denied) return denied;
             // The sync layer reports success even when nothing existed at the
@@ -497,9 +503,101 @@ export function registerTools(
             // readNote returns "" for an empty note and null only when absent.
             const existing = await vault.readNote(path);
             if (existing === null) return `Note not found: ${path}`;
+            if (unlink === false) {
+                const ok = await vault.deleteNote(path);
+                if (ok) searchIndex.remove(path);
+                return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
+            }
+
+            // Backlinks are keyed by path and by name; the name with .md also
+            // catches a markdown link written as a bare file name.
+            const notes = searchIndex.listPaths();
+            if (!notes.some((n) => n.toLowerCase() === path.toLowerCase())) notes.push(path);
+            const linkers = [...new Set([...searchIndex.getBacklinks(path), ...searchIndex.getBacklinks(noteName(path) + ".md")])]
+                .filter((p) => p.toLowerCase() !== path.toLowerCase())
+                .sort();
+            let unlinkedNotes = 0;
+            let unlinkedLinks = 0;
+            let skipped = 0;
+            let unchanged = 0;
+            const details: string[] = [];
+            const unlinkedPaths: string[] = [];
+            for (const linker of linkers) {
+                const ctx = { target: path, notes, source: linker };
+                try {
+                    const text = await vault.readNote(linker);
+                    if (text === null) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker}, the note is gone`);
+                        continue;
+                    }
+                    const first = unlinkLinks(text, ctx);
+                    const leftovers = describeLeftovers(first);
+                    if (first.unlinked === 0) {
+                        unchanged++;
+                        details.push(`- Unchanged: ${linker}, no link in it needs removing${leftovers}`);
+                        continue;
+                    }
+                    const refused = checkWrite(linker, "update", writeFolders);
+                    if (refused) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker} (${plural(first.unlinked, "link")}), no update permission: ${refused}`);
+                        continue;
+                    }
+                    let result = first;
+                    if (vault.updateNote) {
+                        // CouchDB mode: written only at the revision it was read
+                        // at, re-applied to the newer text when another writer
+                        // got in between, so no concurrent edit is overwritten.
+                        try {
+                            await vault.updateNote(linker, (fresh) => {
+                                result = unlinkLinks(fresh, ctx);
+                                if (result.unlinked === 0) throw new NothingToUnlink();
+                                return result.content;
+                            }, { maxAttempts: EDIT_MAX_ATTEMPTS, minRetryMs: EDIT_MIN_RETRY_MS });
+                        } catch (err) {
+                            if (err instanceof NothingToUnlink) {
+                                unchanged++;
+                                details.push(`- Unchanged: ${linker}, its links were removed by another writer${describeLeftovers(result)}`);
+                                continue;
+                            }
+                            throw err;
+                        }
+                    } else if (!(await vault.writeNote(linker, first.content, { mode: "update" }))) {
+                        skipped++;
+                        details.push(`- Not unlinked: ${linker} (${plural(first.unlinked, "link")}), the write failed`);
+                        continue;
+                    }
+                    searchIndex.update(linker, result.content, Date.now());
+                    unlinkedNotes++;
+                    unlinkedLinks += result.unlinked;
+                    unlinkedPaths.push(linker);
+                    details.push(`- Unlinked: ${linker} (${plural(result.unlinked, "link")})${describeLeftovers(result)}`);
+                } catch (err) {
+                    skipped++;
+                    const why = err instanceof NoteNotFoundError
+                        ? "the note is gone"
+                        : err instanceof UpdateRetriesExhaustedError
+                            ? `it kept changing during ${err.attempts} attempts`
+                            : `error: ${(err as Error).message}`;
+                    details.push(`- Not unlinked: ${linker}, ${why}`);
+                }
+            }
+
             const ok = await vault.deleteNote(path);
             if (ok) searchIndex.remove(path);
-            return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
+            const lines = [ok ? `Deleted: ${path}` : `Failed to delete: ${path}`];
+            if (linkers.length > 0) {
+                lines.push(`Links: ${plural(unlinkedLinks, "link")} turned into plain text in ${plural(unlinkedNotes, "note")}; ${skipped} not unlinked; ${unchanged} unchanged.`);
+                if (!ok && unlinkedNotes > 0) {
+                    lines.push(`The note is still there, but the links to it in ${unlinkedPaths.join(", ")} are already plain text.`);
+                }
+            }
+            if (searchIndex.state !== "ready") {
+                lines.push(`The search index is still ${searchIndex.state}, so notes linking to ${path} may be missing from this list.`);
+            }
+            lines.push(...details);
+            return lines.join("\n");
         },
     });
 
@@ -701,6 +799,14 @@ export function registerTools(
             return lines.join("\n");
         },
     });
+}
+
+/** What unlinkLinks left as written, for a delete_note answer line. */
+function describeLeftovers(result: UnlinkResult): string {
+    const parts: string[] = [];
+    if (result.ambiguous > 0) parts.push(`${plural(result.ambiguous, "link")} left as written, since several notes share that name`);
+    if (result.frontmatterKept > 0) parts.push(`${plural(result.frontmatterKept, "link")} in the frontmatter left as written, since removing them would break its YAML`);
+    return parts.length > 0 ? "; " + parts.join("; ") : "";
 }
 
 function plural(n: number, word: string): string {
