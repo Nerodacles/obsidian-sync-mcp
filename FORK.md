@@ -21,10 +21,10 @@ Authentication and write permissions are upstream's: one `MCP_AUTH_TOKEN` and th
 
 ## Kept on branches, not in main
 
-| Branch | Case | What it is |
+| Branch | Status | What it is |
 | --- | --- | --- |
-| `named-tokens-v014` | moo-204 | Several named bearer tokens (`MCP_TOKENS_FILE`), each with its own write permissions. Merging it needs every write path above (including plugin tools and the linker writes of `rename_note`/`delete_note`) moved to the per-call scope, plus a test per token. |
-| `desk-answer-event-v014` | moo-210 | `ctx.onNoteChange` from the CouchDB changes feed, `ctx.parseFrontmatter`, and the example plugin `examples/desk-answer-webhook.mjs` (signed webhook per desk answer). |
+| `named-tokens-v014` | kept for later | Several named bearer tokens (`MCP_TOKENS_FILE`), each with its own write permissions. Merging it needs every write path above (including plugin tools and the linker writes of `rename_note`/`delete_note`) moved to the per-call scope, plus a test per token. |
+| `desk-answer-event-v014` | kept for later | `ctx.onNoteChange` from the CouchDB changes feed, `ctx.parseFrontmatter`, and the example plugin `examples/desk-answer-webhook.mjs` (signed webhook per desk answer). |
 
 ## Harnesses (need a throwaway CouchDB)
 
